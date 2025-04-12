@@ -1,0 +1,3 @@
+[submodule "COIN_Python"]
+	path = COIN_Python
+	url = https://github.com/changmin-yu/COIN_Python.git
