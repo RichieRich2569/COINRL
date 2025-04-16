@@ -34,7 +34,7 @@ from matplotlib.cm import get_cmap
 
 from tqdm import trange
 
-import multiprocessing
+import multiprocess
 
 from utils.general_utils import (
     sample_num_tables_CRF, 
@@ -124,8 +124,8 @@ class COIN:
     def __init__(
         self, 
         sigma_process_noise: float = 0.0089, 
-        sigma_sensory_noise: float = 0.03, 
-        sigma_motor_noise: float = 0.0182, 
+        sigma_sensory_noise: float = 0.003, 
+        sigma_motor_noise: float = 0.00182, 
         prior_mean_retention: float = 0.9425, 
         prior_precision_retention: float = 837.1 ** 2, 
         prior_precision_drift: float = 1.2227e3 ** 2, 
@@ -272,13 +272,15 @@ class COIN:
             
             parallel_coin_main_loop = lambda n: self.coin_main_loop(trials)["stored"]
             
-            # with multiprocessing.Pool(processes=self.max_cores) as pool:
-            #     results = pool.map(parallel_coin_main_loop, range(self.runs))
-            # temp = results
-            with trange(self.runs, dynamic_ncols=True) as pbar:
-                for n in pbar:
-                    coin_state = self.coin_main_loop(trials)
-                    temp.append(coin_state["stored"])
+            if self.max_cores > 0:
+                with multiprocess.Pool(processes=self.max_cores) as pool:
+                    results = pool.map(parallel_coin_main_loop, range(self.runs))
+                temp = results
+            else:
+                with trange(self.runs, dynamic_ncols=True) as pbar:
+                    for n in pbar:
+                        coin_state = self.coin_main_loop(trials)
+                        temp.append(coin_state["stored"])
 
             w = np.ones(self.runs) / self.runs
             
@@ -589,7 +591,7 @@ class COIN:
     
     def resample_particles(self, coin_state: Dict[str, Any]):
         # p(y_t|c_t)
-        coin_state["probability_state_feedback"] = norm(coin_state["state_feedback_mean"], np.sqrt(coin_state["state_feedback_var"])).pdf(coin_state["state_feedback"])
+        coin_state["probability_state_feedback"] = norm(coin_state["state_feedback_mean"], np.sqrt(coin_state["state_feedback_var"])).pdf(coin_state["state_feedback"])+1e-4
         
         if coin_state["feedback_observed"][coin_state["trial"]-1]:
             if coin_state["cues_exist"]:
@@ -609,7 +611,7 @@ class COIN:
         log_weights = log_sum_exp(p_c) # TODO: verify if this is indeed log p(y_t, q_t)
 
         p_c = p_c - log_weights # log p(c_t|y_t, q_t)
-        
+
         # weights for resampling
         w = np.exp(log_weights - log_sum_exp(log_weights.T, axis=0)) # TODO: again, verify if this holds true!
         
