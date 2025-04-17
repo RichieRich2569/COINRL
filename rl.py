@@ -56,6 +56,7 @@ class QLearningAgent:
         epsilon: float = 1.0,
         epsilon_decay: float = 0.999,
         min_epsilon: float = 0.01,
+        init_Q_random: bool = True,
     ):
         """
         Initialize the Q-learning agent with hyperparameters and bin settings.
@@ -69,6 +70,7 @@ class QLearningAgent:
             epsilon (float, optional): Initial epsilon for ε-greedy strategy.
             epsilon_decay (float, optional): Epsilon decay factor after each episode.
             min_epsilon (float, optional): Minimum value of epsilon.
+            init_Q_random (bool, optional): When True, initialise Q-table randomly, otherwise to zeros.
         """
         self.num_position_bins = num_position_bins
         self.num_velocity_bins = num_velocity_bins
@@ -88,7 +90,12 @@ class QLearningAgent:
 
         # Initialize Q-table
         n_actions = env.action_space.n
-        self.Q = np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions))
+        if init_Q_random:
+            self.Q = np.random.uniform(
+                low=-2, high=0, size=(self.num_position_bins, self.num_velocity_bins, n_actions)
+            )
+        else:
+            self.Q = np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions))
 
     def choose_action(self, env: gym.Env, state: Tuple[int, int], eps: float) -> int:
         """
@@ -269,6 +276,7 @@ class COINQLearningAgent:
         epsilon: float = 1.0,
         epsilon_decay: float = 0.999,
         min_epsilon: float = 0.0,
+        init_Q_random: bool = True,
     ):
         """
         Initialize the COIN Q-learning agent with hyperparameters and bin settings.
@@ -282,6 +290,7 @@ class COINQLearningAgent:
             epsilon (float, optional): Initial epsilon for all ε-greedy strategies.
             epsilon_decay (float, optional): Epsilon decay factor after each episode.
             min_epsilon (float, optional): Minimum value of epsilon.
+            init_Q_random (bool, optional): When True, initialise Q-table randomly, otherwise to zeros.
         """
         self.num_position_bins = num_position_bins
         self.num_velocity_bins = num_velocity_bins
@@ -300,8 +309,15 @@ class COINQLearningAgent:
 
         # Initialize Q-table and exploration database
         n_actions = env.action_space.n
-        self.Qdat = [np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions)) for _ in range(max_contexts)]
+        if init_Q_random:
+            self.Qdat = [np.random.uniform(
+                low=-2, high=0, size=(self.num_position_bins, self.num_velocity_bins, n_actions)
+            ) for _ in range(max_contexts)]
+        else:
+            self.Qdat = [np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions)) for _ in range(max_contexts)]
+        
         self.epsdat = [epsilon for _ in range(max_contexts)]
+        
 
     def choose_action(self, env: gym.Env, Q: np.ndarray, state: Tuple[int, int], eps: float) -> int:
         """

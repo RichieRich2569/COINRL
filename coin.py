@@ -124,8 +124,8 @@ class COIN:
     def __init__(
         self, 
         sigma_process_noise: float = 0.0089, 
-        sigma_sensory_noise: float = 0.003, 
-        sigma_motor_noise: float = 0.00182, 
+        sigma_sensory_noise: float = 0.03, 
+        sigma_motor_noise: float = 0.0182, 
         prior_mean_retention: float = 0.9425, 
         prior_precision_retention: float = 837.1 ** 2, 
         prior_precision_drift: float = 1.2227e3 ** 2, 
@@ -268,7 +268,7 @@ class COIN:
         if (self.adaptation is None) or (len(self.adaptation) == 0):
             trials = np.arange(num_trials)
             
-            print("Simulting the COIN model")
+            print("Simulating the COIN model")
             
             parallel_coin_main_loop = lambda n: self.coin_main_loop(trials)["stored"]
             
@@ -301,7 +301,6 @@ class COIN:
             
             # simulate trials in between trials on which adaptation was measured
             for i in range(len(adaptation_trials)):
-                print(i)
                 if i == 0:
                     trials = np.arange(adaptation_trials[i]+1)
                     print(f"Simulating the COIN model from trial 0 to trial {adaptation_trials[i]}")
@@ -324,7 +323,7 @@ class COIN:
                     
                 # update weights and normalise
                 l_w = log_likelihood + np.log(w)
-                l_w = l_w - log_sum_exp(l_w, axis=1) # TODO: check this!
+                l_w = l_w - log_sum_exp(l_w, axis=1)
                 w = np.exp(l_w)
                 
                 # calculate effect sample size
@@ -591,7 +590,7 @@ class COIN:
     
     def resample_particles(self, coin_state: Dict[str, Any]):
         # p(y_t|c_t)
-        coin_state["probability_state_feedback"] = norm(coin_state["state_feedback_mean"], np.sqrt(coin_state["state_feedback_var"])).pdf(coin_state["state_feedback"])+1e-4
+        coin_state["probability_state_feedback"] = norm(coin_state["state_feedback_mean"], np.sqrt(coin_state["state_feedback_var"])).pdf(coin_state["state_feedback"])#+1e-4
         
         if coin_state["feedback_observed"][coin_state["trial"]-1]:
             if coin_state["cues_exist"]:
@@ -928,7 +927,7 @@ class COIN:
         coin_state["local_transition_matrix"] = coin_state["local_transition_matrix"] * zero_mass_contexts
         
         # compute stationary context probabilities if necessary
-        if ("statioanry_probabilities" in self.store) and (coin_state["trial"] > 0):
+        if ("stationary_probabilities" in self.store) and (coin_state["trial"] > 0):
             coin_state["stationary_probabilities"] = np.zeros((self.max_contexts+1, self.particles))
             
             for p in range(self.particles):
@@ -1158,7 +1157,7 @@ class COIN:
         variables_requiring_context_relabelling = [
             "state_given_context", 
             "predicted_probabilities", 
-            "responsibilties", 
+            "responsibilities", 
             "stationary_probabilities", 
             "retention_given_context", 
             "drift_given_context", 
@@ -1174,14 +1173,15 @@ class COIN:
             if self.__dict__[f"plot_{s}"]:
                 P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
                 P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
+                break
             elif i == (len(variables_requiring_context_relabelling)-1):
-                P = self.preallocate_memory([]) # TODO: how does it handle empty dictionary?
+                P = self.preallocate_memory({}) # TODO: how does it handle empty dictionary?
                 P = self.integrate_over_runs(P, S)
         
         self.generate_figures(P)
 
     def find_optimal_context_labels(self, S: Dict[str, Any]):
-        inds_resampled = self.resample_inds(S)
+        inds_resampled = self.resample_inds(S) # TODO: Check S["runs"].inds_resampled in resample_inds
         context_sequence = self.context_sequence(S, inds_resampled)
         C, _, _, mode_number_of_contexts = self.posterior_number_of_contexts(context_sequence, S)
         
@@ -1189,9 +1189,9 @@ class COIN:
         P["mode_number_of_contexts"] = mode_number_of_contexts
         
         # context label permutations
-        L = np.array(list(permutations(np.arange(np.max(mode_number_of_contexts)+1))))
+        L = np.array(list(permutations(np.arange(1,np.max(mode_number_of_contexts).astype(int)+1))))
         L = np.transpose(L[None], (2, 0, 1))
-        n_perms = factorial(np.max(mode_number_of_contexts)+1) # + 1) # TODO: do we need +1?
+        n_perms = factorial(np.max(mode_number_of_contexts).astype(int))
         
         num_trials = len(self.perturbations)
         
@@ -1206,7 +1206,7 @@ class COIN:
             
             # exclude sequences for which C > max(mode_number_of_context) as these sequences
             # (and their descendents) will never be analysed
-            f[i] = np.where(C[:, i] <= np.max(mode_number_of_contexts)+1)[0]
+            f[i] = np.where(C[:, i] <= np.max(mode_number_of_contexts))[0]
             
             # identify unique sequences (to avoid performing the same computations multiple times)
             unique_seqs, inds, reverse_inds = np.unique(
@@ -1231,7 +1231,7 @@ class COIN:
                 inds, _ = np.where(f[i-1][:, None] == inds_resampled[f[i][to_unique[i]], i][None])
                 parent = from_unique[i-1][inds]
                 
-                # pass Hamming distances from parents to children
+                # pass Hamming distances from parents to children - TODO: Check this against MATLAB - Currently not getting any 0 distance points
                 inds_1 = np.tile(parent[:, None, None], [1, n_sequences, n_perms])
                 inds_2 = np.tile(parent[None, :, None], [n_sequences, 1, n_perms])
                 inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
@@ -1262,7 +1262,7 @@ class COIN:
             
             # compute the mean optimal Hamming distance of each sequence to all other sequences.
             # the distance from sequence i to sequence j is weighted by the number of times sequence j occurs.
-            # if i == j, this weight is reduced by 1 so that the distance from one instance of sequence i to itself is ignore.
+            # if i == j, this weight is reduced by 1 so that the distance from one instance of sequence i to itself is ignored.
             H_mean = np.mean(H_optimal * (sequence_count[None] - np.eye(n_sequences)), axis=1)
             
             # assign infinite distance to invalid sequences 
@@ -1279,7 +1279,7 @@ class COIN:
             # store the optimal permutation of labels for each sequence with respect to the typical sequence
             j = np.argmin(H[min_ind, :, :], axis=-1)
             optimal_assignment[i] = np.transpose(
-                L[:int(mode_number_of_contexts[i]+1), :, j].reshape((int(mode_number_of_contexts[i]+1), -1, 1)), 
+                L[:int(mode_number_of_contexts[i]), :, j].reshape((int(mode_number_of_contexts[i]), -1, 1)), 
                 [2, 0, 1], 
             )
         
@@ -1319,6 +1319,7 @@ class COIN:
         
         # number of contexts
         C = np.zeros((self.particles * self.runs, num_trials), dtype=int)
+
         for n in range(self.runs):
             p = self.particles * n + np.arange(self.particles)
             for i in range(num_trials):
@@ -1328,14 +1329,14 @@ class COIN:
         
         posterior = np.zeros((self.max_contexts+1, num_trials))
         posterior_mean = np.zeros((num_trials, ))
-        posterior_mode = np.zeros((num_trials, ))
+        posterior_mode = np.zeros((num_trials, ), dtype=int)
         
         for i in range(num_trials):
             for context in range(np.max(C[:, i])):
                 posterior[context, i] = np.sum((C[:, i] == (context+1)) * particle_weight)
             
-            posterior_mean[i] = np.sum(np.arange(self.max_contexts+1) * posterior[:, i])
-            posterior_mode[i] = np.argmax(posterior[:, i])
+            posterior_mean[i] = np.sum(np.arange(1,self.max_contexts+2) * posterior[:, i])
+            posterior_mode[i] = np.argmax(posterior[:, i])+1 # contexts seen as 1 and not 0
         
         return C, posterior, posterior_mean, posterior_mode
 
@@ -1372,7 +1373,7 @@ class COIN:
                 # C == np.max(P["mode_number_of_contexts"])
                 valid_now = np.where(C[p, i] == P["mode_number_of_contexts"][i])[0]
                 n_particles_used[i, n] = len(valid_now)
-                
+
                 if len(valid_now) > 0:
                     for particle in valid_now:
                         # index of the optimal label permutations of the current particle
@@ -1381,7 +1382,11 @@ class COIN:
                         # is the latest context a novel context
                         # this is needed to store novel context probabilities
                         context_trajectory = context_sequence[i][p[particle], :]
-                        novel_context = context_trajectory[i] > np.max(context_trajectory[:i])
+                        
+                        if i > 0:
+                            novel_context = context_trajectory[i] > np.max(context_trajectory[:i])
+                        else:
+                            novel_context = False
                         
                         S = self.relabel_context_variables(S, optimal_assignment[i][0, from_unique[i][ind][0], :].astype(int), novel_context, particle, i, n)
                     P = self.integrate_over_particles(S, P, valid_now, i, n)
@@ -1543,7 +1548,7 @@ class COIN:
         run: int, 
     ):
         C = int(P["mode_number_of_contexts"][trial])
-        novel_context = np.max(P["mode_number_of_contexts"]) + 1
+        novel_context = np.max(P["mode_number_of_contexts"]).astype(int) + 1
         
         num_trials = len(self.perturbations)
         
@@ -1779,7 +1784,7 @@ class COIN:
         if self.plot_predicted_probabilities:
             fig, ax = plt.subplots(1, 1, figsize=(5, 5))
             ax.plot(P["predicted_probabilities"][:, -1], color=colors["new_context"], linewidth=lw)
-            for context in np.arange(np.max(P["mode_number_of_contexts"])):
+            for context in np.arange(np.max(P["mode_number_of_contexts"])).astype(int):
                 predicted_probs = P["predicted_probabilities"][:, context]
                 t = np.where(~np.isnan(P["predicted_probabilities"][:, context]))[0][0]
                 predicted_probs[t-1] = P["predicted_probabilities"][t-1, -1]
