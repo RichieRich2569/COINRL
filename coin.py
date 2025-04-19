@@ -1180,8 +1180,8 @@ class COIN:
         
         self.generate_figures(P)
 
-    def find_optimal_context_labels(self, S: Dict[str, Any]):
-        inds_resampled = self.resample_inds(S) # TODO: Check S["runs"].inds_resampled in resample_inds
+    def find_optimal_context_labels(self, S: Dict[str, Any]): # CHECKED FOR MATLAB CONSISTENCY
+        inds_resampled = self.resample_inds(S)
         context_sequence = self.context_sequence(S, inds_resampled)
         C, _, _, mode_number_of_contexts = self.posterior_number_of_contexts(context_sequence, S)
         
@@ -1189,7 +1189,7 @@ class COIN:
         P["mode_number_of_contexts"] = mode_number_of_contexts
         
         # context label permutations
-        L = np.array(list(permutations(np.arange(1,np.max(mode_number_of_contexts).astype(int)+1))))
+        L = np.array(list(permutations(np.arange(0,np.max(mode_number_of_contexts).astype(int)))))
         L = np.transpose(L[None], (2, 0, 1))
         n_perms = factorial(np.max(mode_number_of_contexts).astype(int))
         
@@ -1224,7 +1224,7 @@ class COIN:
             if i == 0:
                 # hamming distances on trial 0
                 # dimension 2 of H considers all possible label permutations
-                H = (L[[0], :, :] != 1) * 1.0 # (1, 1, num_permutations)
+                H = (L[[0], :, :] != 0) * 1.0 # (1, 1, num_permutations)
             else:
                 # identify a valid parent of each unique sequence
                 # i.e., a sequence on the previous trial that is identical up to the previous trial
@@ -1387,8 +1387,8 @@ class COIN:
                             novel_context = context_trajectory[i] > np.max(context_trajectory[:i])
                         else:
                             novel_context = False
-                        
-                        S = self.relabel_context_variables(S, optimal_assignment[i][0, from_unique[i][ind][0], :].astype(int), novel_context, particle, i, n)
+
+                        S = self.relabel_context_variables(S, optimal_assignment[i][0, :, from_unique[i][ind][0]].astype(int), novel_context, particle, i, n)
                     P = self.integrate_over_particles(S, P, valid_now, i, n)
                 
                 N += len(valid_future)
