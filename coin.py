@@ -1597,9 +1597,9 @@ class COIN:
         
         return P
     
-    def sum_along_dimension(self, X: np.ndarray, dim: int):
-        nan_inds = np.all(np.isnan(X), axis=dim)
-        X = np.nansum(X, axis=dim)
+    def sum_along_dimension(self, X: np.ndarray, axis: int):
+        nan_inds = np.all(np.isnan(X), axis=axis)
+        X = np.nansum(X, axis=axis)
         X[nan_inds] = np.nan
         
         return X
@@ -1721,8 +1721,8 @@ class COIN:
             P["predicted_probabilities"][1:, :] = P["predicted_probabilities"][1:, :] / Z[:-1][None]
         if self.plot_responsibilities:
             P["responsibilities"] = P["responsibilities"] / Z[None]
-            P["novel_context_responsibility"] = P["responsibilities"][:, -1]
-            P["known_context_responsibilities"] = P["responsibilities"][:, :-1]
+            P["novel_context_responsibility"] = P["responsibilities"][0, :, -1]
+            P["known_context_responsibilities"] = P["responsibilities"][0, :, :-1]
         if self.plot_stationary_probabilities:
             P["stationary_probabilities"] = P["stationary_probabilities"] / Z[None]
         if self.plot_retention_given_context:
@@ -1742,6 +1742,12 @@ class COIN:
 
         return P
 
+    def get_responsibilities(self, S: Dict[str, Any]):
+        self.plot_responsibilities = True # Set to true but we will not be plotting - shortcut to avoid editing existing code
+        P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
+        P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
+        return P["known_context_responsibilities"], P["novel_context_responsibility"]
+    
     def generate_figures(self, P: Dict[str, Any]):
         colors = self.colors()
         
@@ -1801,7 +1807,7 @@ class COIN:
         if self.plot_responsibilities:
             fig, ax = plt.subplots(1, 2, figsize=(12, 5))
             for context in range(np.max(P["mode_number_of_contexts"])):
-                ax[0].plot(P["known_context_responsibilties"][:, context], color=colors["contexts"][context, :], linewidth=lw)
+                ax[0].plot(P["known_context_responsibilities"][:, context], color=colors["contexts"][context, :], linewidth=lw)
             ax[0].set_xlim(0, num_trials)
             ax[0].set_ylim(-0.1, 1.1)
             ax[0].set_xticks([0, num_trials])

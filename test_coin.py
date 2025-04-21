@@ -60,6 +60,7 @@ def main():
         state_feedback_values=state_feedback_values, 
         store=store, 
         plot_predicted_probabilities = True,
+        plot_responsibilities = True,
     )
     coin_model.perturbations = np.concatenate([
         np.zeros((50, )), 
