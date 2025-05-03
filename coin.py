@@ -150,7 +150,15 @@ class COIN:
         # measured adaptation
         adaptation: Optional[np.ndarray] = None, 
         # store
-        store: List[str] = ["state_feedback", "motor_output"], 
+        store: List[str] = [
+            "responsibilities",
+            "state_feedback",
+            "inds_resampled", # Inds resampled, context and motor output must be stored for labelling
+            "context",
+            "motor_output",
+            "predicted_probabilities",
+            "C",
+        ], 
         # evaluation
         retention_values: Optional[np.ndarray] = None, 
         drift_values: Optional[np.ndarray] = None, 
@@ -1747,6 +1755,12 @@ class COIN:
         P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
         P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
         return P["known_context_responsibilities"], P["novel_context_responsibility"]
+
+    def get_predicted_probabilities(self, S: Dict[str, Any]):
+        self.plot_predicted_probabilities = True # Set to true but we will not be plotting - shortcut to avoid editing existing code
+        P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
+        P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
+        return P["predicted_probabilities"]
     
     def generate_figures(self, P: Dict[str, Any]):
         colors = self.colors()

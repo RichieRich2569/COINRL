@@ -312,11 +312,15 @@ class COINQLearningAgent:
         if init_Q_random:
             self.Qdat = [np.random.uniform(
                 low=-2, high=0, size=(self.num_position_bins, self.num_velocity_bins, n_actions)
-            ) for _ in range(max_contexts)]
+            ) for _ in range(max_contexts+1)] # Also set one up for the novel context
         else:
-            self.Qdat = [np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions)) for _ in range(max_contexts)]
+            self.Qdat = [np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions)) for _ in range(max_contexts+1)]
         
-        self.epsdat = [epsilon for _ in range(max_contexts)]
+        # Track which contexts have been initialised - only novel initialised initially
+        self.context_init = np.zeros((max_contexts+1,))
+        self.context_init[-1] = 1
+
+        self.epsdat = [epsilon for _ in range(max_contexts)] # Epsilon for each context (not novel)
         
 
     def choose_action(self, env: gym.Env, Q: np.ndarray, state: Tuple[int, int], eps: float) -> int:
@@ -330,7 +334,8 @@ class COINQLearningAgent:
         Returns:
             int: Action chosen by the policy.
         """
-        if np.random.random() < eps:
+        rand = np.random.random()
+        if rand < eps:
             return env.action_space.sample()
         return np.argmax(Q[state])
 
@@ -355,10 +360,18 @@ class COINQLearningAgent:
         """
         best_next_action = np.argmax(Qavg[next_state])
         for i in range(len(self.Qdat)):
-            td_target = reward + self.gamma * self.Qdat[i][next_state][best_next_action]
-            td_error = td_target - self.Qdat[i][state][action]
-            self.Qdat[i][state][action] += p_context[i] * self.alpha * td_error
+            if self.context_init[i] and not np.isnan(p_context[i]):
+                td_target = reward + self.gamma * self.Qdat[i][next_state][best_next_action]
+                td_error = td_target - self.Qdat[i][state][action]
+                self.Qdat[i][state][action] += p_context[i] * self.alpha * td_error
 
+    def instantiate_context_Q(
+            self,
+            new_context,
+    ):
+        """When a novel context is instantiated, copy current Q novel table to that new context value."""
+        self.Qdat[new_context] = self.Qdat[-1].copy()
+        
     def train_step(
         self,
         env : gym.Env,
@@ -382,13 +395,23 @@ class COINQLearningAgent:
         state = discretize_state(obs, self.position_bins, self.velocity_bins)
         episode_reward = 0.0
 
+        # Check if new context initialised
+        for i, init in enumerate(self.context_init):
+            if init == 0 and not np.isnan(p_context[i]):
+                # Context initialised
+                self.instantiate_context_Q(i)
+                # Update tracking
+                self.context_init[i] = 1
+
         for _ in range(max_steps_per_episode):
             # Find average Q and eps
-            Qavg = np.zeros(self.Qdat[0].shape)
+            Qavg = np.zeros_like(self.Qdat[0])
             epsavg = 0.0
             for i in range(len(self.Qdat)):
-                Qavg += p_context[i] * self.Qdat[i]
-                epsavg += p_context[i] * self.epsdat[i]
+                ctx_exp = self.epsdat[i] if i < len(self.epsdat) else 1.0
+                if self.context_init[i] and not np.isnan(p_context[i]):
+                    Qavg += p_context[i] * self.Qdat[i]
+                    epsavg += p_context[i] * ctx_exp
 
             # Choose action
             action = self.choose_action(env, Qavg, state, epsavg)
@@ -406,9 +429,10 @@ class COINQLearningAgent:
             if done or truncated:
                 break
 
-        # Epsilon decay - every value
-        for i in range(len(self.Qdat)):
-            self.epsdat[i] = max(self.min_epsilon, self.epsdat[i] * self.epsilon_decay**(p_context[i]))
+        # Epsilon decay - for every context
+        for i in range(len(self.epsdat)):
+            if self.context_init[i] and not np.isnan(p_context[i]):
+                self.epsdat[i] = max(self.min_epsilon, self.epsdat[i] * self.epsilon_decay**(p_context[i]))
 
         # End of training
         env.close()
