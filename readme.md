@@ -3,19 +3,22 @@
 This repository accompanies our paper on **contextual reinforcement learning** with the COIN generative model.  
 It contains:
 
-├── basic_crl.py # fixed-context CECE example
-├── coin.py # COIN particle-filter implementation (by Changmin Yu)
-├── environments.py # parametrisable Gymnasium envs (custom)
-├── rl.py # tabular & contextual Q-learning agents
-├── basics.ipynb # basic testing of rl modules and new coin approaches
-├── figures.ipynb # all training and evaluation of the paper's figures in a jupyter notebook format.
+```text
+.
+├── basic_crl.py              # fixed-context CECE example
+├── coin.py                   # COIN particle-filter implementation (by Changmin Yu)
+├── environments.py           # parametrisable Gymnasium envs (custom)
+├── rl.py                     # tabular & contextual Q-learning agents
+├── basics.ipynb              # quick smoke-test notebook
+├── figures.ipynb             # reproduces all paper figures
 ├── utils/
-│ ├── clustering.py
-│ ├── distribution_utils.py
-│ ├── general_utils.py
-│ └── plot_utils.py
-├── figures/ # auto-generated figures land here
-└── models/ # pre-trained models
+│   ├── clustering.py
+│   ├── distribution_utils.py
+│   ├── general_utils.py
+│   └── plot_utils.py
+├── figures/                  # auto-generated figures land here
+└── models/                   # pre-trained model checkpoints
+```
 
 
 ---
