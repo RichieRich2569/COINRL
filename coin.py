@@ -1,4 +1,10 @@
 """
+This code has been adapted from the Python implementation of COIN by
+Changmin Yu (https://github.com/changmin-yu/COIN_Python). Some of the
+code has been modified for the purposes of this project - mainly to
+explicitly indicate predicted probabilities.
+
+---------------------------------------------------------------------
 Copyright (c) 2024 Changmin Yu
 
 This file is part of COIN_Python.
@@ -158,6 +164,8 @@ class COIN:
             "motor_output",
             "predicted_probabilities",
             "C",
+            "state_mean",
+            "state_var"
         ], 
         # evaluation
         retention_values: Optional[np.ndarray] = None, 
@@ -1406,8 +1414,8 @@ class COIN:
         
         if self.plot_state_given_context:
             P["state_given_novel_context"] = np.tile(
-                np.nanmean(P["state_given_context"][:, :, -1], axis=1, keepdims=True), 
-                [1, num_trials, 1, 1], 
+                np.nanmean(P["state_given_context"][:, :, -1], axis=1, keepdims=True)[:,:,None], 
+                [1, num_trials, 1], 
             )
             P["state_given_context"] = P["state_given_context"][:, :, :-1]
         
@@ -1416,7 +1424,7 @@ class COIN:
     def preallocate_memory(self, P: Dict[str, Any]):
         num_trials = len(self.perturbations)
 
-        mode_number_of_contexts = P["mode_number_of_contexts"].astype(int)+1
+        mode_number_of_contexts = P["mode_number_of_contexts"].astype(int)
         if self.plot_state_given_context:
             P["state_given_context"] = np.ones(
                 (self.state_values.size, num_trials, np.max(mode_number_of_contexts)+1, self.runs)
@@ -1556,7 +1564,7 @@ class COIN:
         run: int, 
     ):
         C = int(P["mode_number_of_contexts"][trial])
-        novel_context = np.max(P["mode_number_of_contexts"]).astype(int) + 1
+        novel_context = np.max(P["mode_number_of_contexts"]).astype(int)
         
         num_trials = len(self.perturbations)
         
@@ -1749,6 +1757,13 @@ class COIN:
             P["local_cue_probabilities"] = P["local_cue_probabilities"] / Z[None, None]
 
         return P
+    
+    def get_state_given_context(self, S: Dict[str, Any], state_val: np.ndarray):
+        self.state_values = state_val
+        self.plot_state_given_context = True # Set to true but we will not be plotting - shortcut to avoid editing existing code
+        P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
+        P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
+        return P["state_given_context"], P["state_given_novel_context"]
 
     def get_responsibilities(self, S: Dict[str, Any]):
         self.plot_responsibilities = True # Set to true but we will not be plotting - shortcut to avoid editing existing code
@@ -1761,6 +1776,33 @@ class COIN:
         P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
         P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
         return P["predicted_probabilities"]
+    
+    def get_predicted_responsibilities(self, S: Dict[str, Any], y: np.ndarray):
+        # Obtain responsibilities given different state feedback values from a starting predicted probability
+
+        # Obtain predicted probabilities
+        self.plot_predicted_probabilities = True
+        self.state_values = y # Only valid for low observation noise
+        self.plot_state_given_context = True
+
+        P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
+        P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
+
+        # Obtain required probabilities
+        pred_prob = P["predicted_probabilities"]
+        y_c, y_cn = P["state_given_context"], P["state_given_novel_context"]
+        y_c = np.concatenate([y_c, y_cn], axis=-1)
+
+        # Now obtain predictions
+        pred_resp = y_c * pred_prob[None,:,:]
+        pred_resp = pred_resp/(np.nansum(pred_resp, axis=2, keepdims=True) + 1e-4) # Marginalise in context
+
+        # Make sure to always have a novel value
+        p_temp = pred_resp.copy()
+        p_temp[np.isnan(p_temp)] = 0.0
+        pred_resp[:,:,-1] = 1 - np.sum(p_temp[:,:,:-1], axis=2)
+
+        return pred_resp
     
     def generate_figures(self, P: Dict[str, Any]):
         colors = self.colors()
@@ -1785,15 +1827,15 @@ class COIN:
                 ax=ax[0], 
             )
             ax[0].set_xticks([0, num_trials-1])
-            ax[0].set_xtick_labels([1, num_trials])
+            ax[0].set_xticklabels([1, num_trials])
             ax[0].set_xlim([0, num_trials-1])
             
             ax[0].set_ylabel("state|context")
             ax[0].set_xlabel("trials")
             
-            self.plot_image(P["state_given_novel_context"], y_lims, y_ticks, colors["new_context"], ax=ax[1])
+            self.plot_image(P["state_given_novel_context"], y_lims, y_ticks, [colors["new_context"]], ax=ax[1])
             ax[1].set_xticks([0, num_trials-1])
-            ax[1].set_xtick_labels([1, num_trials])
+            ax[1].set_xticklabels([1, num_trials])
             ax[1].set_xlim([0, num_trials-1])
             
             ax[1].set_ylabel("state|novel_context")
@@ -2159,7 +2201,7 @@ class COIN:
             intensity = X[:, :, context] / np.max(X[:, :, context])
             for rgb in range(3):
                 data[:, :, rgb] = np.nansum(
-                    np.concatenate([data[:, :, rgb], (1-rgb_colors[context][rgb]) * intensity], axis=2), 
+                    np.concatenate([data[:, :, rgb][:,:,None], ((1-rgb_colors[context][rgb]) * intensity[:,:,None])], axis=2), 
                     axis=2
                 )
         if y_lim[0] < y_lim[1]:
@@ -2173,7 +2215,7 @@ class COIN:
         y_ticks = np.sort(y_ticks)[::-1]
         
         ax.set_yticks(y_ticks_pixels)
-        ax.set_ytick_labels(y_ticks)
+        ax.set_yticklabels(y_ticks)
     
     def map_to_pixel_space(self, n_pixels: int, lims: List[float], y_ticks: List[float]):
         lims = np.sort(lims)[::-1]

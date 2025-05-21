@@ -1,0 +1,16 @@
+# Core scientific stack
+numpy>=1.24
+scipy>=1.10          # used for truncated-normal & γ-distribution sampling :contentReference[oaicite:0]{index=0}
+matplotlib>=3.8      # plotting utilities & figure generation :contentReference[oaicite:1]{index=1}
+
+# Machine-learning / RL
+torch>=2.2           # neural-network back-ends in rl.py :contentReference[oaicite:2]{index=2}
+gymnasium[classic-control]>=0.29
+tqdm>=4.66           # progress bars in training loops :contentReference[oaicite:3]{index=3}
+
+# Parallelism
+multiprocess>=0.70   # parallel particle filtering in coin.py :contentReference[oaicite:4]{index=4}
+
+# Jupyter
+jupyterlab>=4.1  # full web UI; brings in notebook 7.x
+ipykernel>=6.29  # kernel that drives *.ipynb cells

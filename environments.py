@@ -2,18 +2,172 @@ import numpy as np
 import math
 import gymnasium as gym
 from gymnasium.envs.classic_control.mountain_car import MountainCarEnv
+from gymnasium.envs.classic_control.cartpole import CartPoleEnv
+from gymnasium.envs.classic_control.pendulum import PendulumEnv
+from gymnasium.envs.classic_control.acrobot import AcrobotEnv
 from gymnasium.error import DependencyNotInstalled
 
-class CustomMountainCarEnv(MountainCarEnv):
+# TimeLimitMixin – adds internal step-counting & truncation
+class TimeLimitMixin:
+    """
+    Adds Gymnasium-style truncation without relying on the TimeLimit wrapper.
+    `self._elapsed_steps` is reset to 0 on `reset()` and incremented on every
+    `step()`.  `truncated` is True when the counter reaches
+    `self._max_episode_steps`.
+    """
+    def __init__(self, *args, max_episode_steps: int | None = None, **kwargs):
+        super().__init__(*args, **kwargs)          # ──> call parent __init__
+        # Prefer a user-supplied limit, then the env spec, else a sane default
+        self._max_episode_steps = (
+            max_episode_steps
+            or (self.spec.max_episode_steps if self.spec is not None else 500)
+        )
+        self._elapsed_steps = 0
+
+    # -------------------------------------------------
+    # standard Gymnasium API
+    # -------------------------------------------------
+    def reset(self, *args, **kwargs):
+        self._elapsed_steps = 0
+        return super().reset(*args, **kwargs)
+
+    def step(self, action):
+        # Call the parent env to get obs, reward, terminated, truncated, info
+        obs, reward, terminated, _, info = super().step(action)
+
+        # bookkeeping
+        self._elapsed_steps += 1
+        truncated = self._elapsed_steps >= self._max_episode_steps
+
+        return obs, reward, terminated, truncated, info
+
+
+class CustomCartPoleEnv(TimeLimitMixin, CartPoleEnv):
+    """CartPole with tunable physics."""
+
+    def __init__(
+        self,
+        gravity: float = 9.8,
+        masscart: float = 1.0,
+        masspole: float = 0.1,
+        length: float = 0.5,       # actually half the pole length
+        force_mag: float = 10.0,
+        tau: float = 0.02,
+        theta_threshold_radians: float | None = None,
+        x_threshold: float | None = None,
+        max_episode_steps: int | None = None,
+        **kwargs,
+    ):
+        TimeLimitMixin.__init__(self, max_episode_steps=max_episode_steps)
+        CartPoleEnv.__init__(self, render_mode=kwargs.pop("render_mode", None))
+
+        # --- user‑defined parameters ---
+        self.gravity = gravity
+        self.masscart = masscart
+        self.masspole = masspole
+        self.length = length
+        self.force_mag = force_mag
+        self.tau = tau
+        if theta_threshold_radians is not None:
+            self.theta_threshold_radians = theta_threshold_radians
+        if x_threshold is not None:
+            self.x_threshold = x_threshold
+
+        # --- recomputed derived values ---
+        self.total_mass = self.masspole + self.masscart
+        self.polemass_length = self.masspole * self.length
+
+
+class CustomPendulumEnv(TimeLimitMixin, PendulumEnv):
+    """Pendulum with adjustable parameters"""
+
+    def __init__(
+        self,
+        g: float = 9.8,
+        m: float = 1.0,
+        l: float = 1.0,
+        max_speed: float = 8.0,
+        max_torque: float = 2.0,
+        dt: float = 0.05,
+        max_episode_steps: int | None = None,
+        **kwargs,
+    ):
+        TimeLimitMixin.__init__(self, max_episode_steps=max_episode_steps)
+        PendulumEnv.__init__(self, render_mode=kwargs.pop("render_mode", None))
+        self.g = g
+        self.m = m
+        self.l = l
+        self.max_speed = max_speed
+        self.max_torque = max_torque
+        self.dt = dt  # NB: PendulumEnv uses _dt internally; update both
+        self._dt = dt
+
+        # No extra derived constants required—PendulumEnv queries these directly
+
+
+class CustomAcrobotEnv(TimeLimitMixin, AcrobotEnv):
+    """Acrobot with tunable link lengths, masses, and gravity."""
+
+    def __init__(
+        self,
+        link_length_1: float = 1.0,
+        link_length_2: float = 1.0,
+        link_mass_1: float = 1.0,
+        link_mass_2: float = 1.0,
+        link_com_pos_1: float = 0.5,   # COM position wrt link length
+        link_com_pos_2: float = 0.5,
+        link_moi: float = 1.0,
+        max_vel_1: float = 4 * 3.1416,
+        max_vel_2: float = 9 * 3.1416,
+        torque_mag: float = 1.0,
+        gravity: float = 9.8,
+        dt: float = 0.2,
+        max_episode_steps: int | None = None,
+        **kwargs,
+    ):
+        TimeLimitMixin.__init__(self, max_episode_steps=max_episode_steps)
+        AcrobotEnv.__init__(self, render_mode=kwargs.pop("render_mode", None))
+
+        # --- user‑defined parameters ---
+        self.LINK_LENGTH_1 = link_length_1
+        self.LINK_LENGTH_2 = link_length_2
+        self.LINK_MASS_1 = link_mass_1
+        self.LINK_MASS_2 = link_mass_2
+        self.LINK_COM_POS_1 = link_com_pos_1
+        self.LINK_COM_POS_2 = link_com_pos_2
+        self.LINK_MOI = link_moi
+        self.MAX_VEL_1 = max_vel_1
+        self.MAX_VEL_2 = max_vel_2
+        self.TORQUE_MAG = torque_mag
+        self.GRAVITY = gravity
+        self.dt = dt
+
+        # --- recomputed helper constants ---
+        self.I1 = (
+            self.LINK_MASS_1
+            * self.LINK_COM_POS_1**2
+            + self.LINK_MOI
+        )
+        self.I2 = (
+            self.LINK_MASS_2
+            * self.LINK_COM_POS_2**2
+            + self.LINK_MOI
+        )
+        # AcrobotEnv’s dynamics refer directly to these attributes; updating
+        # them here suffices.
+
+class CustomMountainCarEnv(TimeLimitMixin, MountainCarEnv):
     """A MountainCar environment that allows customizing the amplitude of the slope."""
     
-    def __init__(self, amplitude=1, gravity_sf=1, max_speed_sf=1, force_sf=1, goal_position=0.5, goal_velocity=0, render_mode=None):
+    def __init__(self, amplitude=1, gravity_sf=1, max_speed_sf=1, force_sf=1, goal_position=0.5, max_episode_steps=None, **kwargs):
         """
         amplitude: The 'A' in y = A sin(3x) + offset
         goal_position: The x-position at which the episode terminates successfully.
         goal_velocity: Required velocity upon reaching the goal (default 0).
         """
-        super().__init__(goal_velocity=goal_velocity, render_mode=render_mode)
+        TimeLimitMixin.__init__(self, max_episode_steps=max_episode_steps)
+        MountainCarEnv.__init__(self, render_mode=kwargs.pop("render_mode", None),
+                                goal_velocity=kwargs.get("goal_velocity", 0))
         self.amplitude = amplitude
         self.gravity_sf = gravity_sf
         self.max_speed_sf = max_speed_sf

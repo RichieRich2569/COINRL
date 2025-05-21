@@ -4,3 +4,6 @@
 # Ignore pycache files
 */__pycache__/
 __pycache__/
+
+# Ignore vscode settings
+.vscode/
