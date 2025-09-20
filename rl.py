@@ -190,7 +190,7 @@ class QLearningAgent:
         print_freq: int = 200
     ) -> Tuple[np.ndarray, List[float]]:
         """
-        Train the Q-learning agent in its environment using an -greedy policy.
+        Train the Q-learning agent in its environment using an e-greedy policy.
 
         Args:
             n_episodes (int, optional): Number of training episodes.
@@ -563,11 +563,14 @@ class PPOAgent:
         lr: float = 3e-4,
         ent_coef: float = 0.0,
         vf_coef: float = 0.5,
-        device: str = "cpu"
+        device: str = "cpu",
+        action_continuous: bool = False
     ):
         self.gamma, self.lam = gamma, gae_lambda
         self.clip_eps, self.ent_coef, self.vf_coef = clip_eps, ent_coef, vf_coef
         self.device = device
+        
+        self.action_continuous = action_continuous
 
         self.policy = _MLP(obs_dim, act_dim).to(device)
         self.value_net = _MLP(obs_dim, 1).to(device)
@@ -581,8 +584,14 @@ class PPOAgent:
         logits = self.policy(obs)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
+        action_np = action.detach().cpu().numpy()
         logp = dist.log_prob(action)
-        return action.item(), logp, dist.entropy(), logits
+        if self.action_continuous and action_np.shape == ():  # scalar case
+            action_np = np.array([action_np])  # wrap in 1D array
+        else:
+            action_np = action_np.item()
+
+        return action_np, logp, dist.entropy(), logits
 
     def _compute_advantages(
         self,

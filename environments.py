@@ -6,6 +6,7 @@ from gymnasium.envs.classic_control.cartpole import CartPoleEnv
 from gymnasium.envs.classic_control.pendulum import PendulumEnv
 from gymnasium.envs.classic_control.acrobot import AcrobotEnv
 from gymnasium.error import DependencyNotInstalled
+import os.path as path
 
 # TimeLimitMixin – adds internal step-counting & truncation
 class TimeLimitMixin:
@@ -103,6 +104,118 @@ class CustomPendulumEnv(TimeLimitMixin, PendulumEnv):
         self._dt = dt
 
         # No extra derived constants required—PendulumEnv queries these directly
+        
+    def render(self):
+        """Render the pendulum using the *current* length self.l."""
+        if self.render_mode is None:
+            assert self.spec is not None
+            gym.logger.warn(
+                "You called render without specifying render_mode; "
+                'pass render_mode="human" or "rgb_array" when you create the env.'
+            )
+            return
+
+        # ---- lazy import / surface initialisation --------------------
+        try:
+            import pygame
+            from pygame import gfxdraw
+        except ImportError as e:
+            raise DependencyNotInstalled(
+                'pygame is not installed, run `pip install "gymnasium[classic_control]"`'
+            ) from e
+
+        if self.screen is None:
+            pygame.init()
+            if self.render_mode == "human":
+                pygame.display.init()
+                self.screen = pygame.display.set_mode(
+                    (self.screen_dim, self.screen_dim)
+                )
+            else:  # "rgb_array"
+                self.screen = pygame.Surface((self.screen_dim, self.screen_dim))
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
+
+        # ---- drawing surface ----------------------------------------
+        self.surf = pygame.Surface((self.screen_dim, self.screen_dim))
+        self.surf.fill((255, 255, 255))
+
+        # World-to-pixel conversion
+        bound = 2.2                                   # keep field-of-view fixed
+        scale = self.screen_dim / (bound * 2)         # px per world-unit
+        offset = self.screen_dim // 2                 # screen centre
+
+        rod_length = self.l * scale                   # <-- length now respects self.l
+        rod_width  = 0.2 * scale
+
+        # Four corners of the rod (before rotation)
+        l, r, t, b = 0, rod_length, rod_width / 2, -rod_width / 2
+        coords = [(l, b), (l, t), (r, t), (r, b)]
+
+        # Rotate to current angle θ and translate to screen centre
+        theta = self.state[0]
+        transformed = [
+            (pygame.math.Vector2(c).rotate_rad(theta + np.pi / 2) + (offset, offset))
+            for c in coords
+        ]
+        gfxdraw.aapolygon(self.surf, transformed, (204, 77, 77))
+        gfxdraw.filled_polygon(self.surf, transformed, (204, 77, 77))
+
+        # Axle
+        gfxdraw.aacircle(self.surf, offset, offset, int(rod_width / 2), (204, 77, 77))
+        gfxdraw.filled_circle(self.surf, offset, offset, int(rod_width / 2), (204, 77, 77))
+
+        # Bob
+        rod_end = pygame.math.Vector2(rod_length, 0).rotate_rad(theta + np.pi / 2)
+        rod_end = (int(rod_end[0] + offset), int(rod_end[1] + offset))
+        gfxdraw.aacircle(self.surf, *rod_end, int(rod_width / 2), (204, 77, 77))
+        gfxdraw.filled_circle(self.surf, *rod_end, int(rod_width / 2), (204, 77, 77))
+
+        img = None
+        try:
+            # Locate the file inside Gymnasium’s classic-control package
+            #   …/gymnasium/envs/classic_control/assets/clockwise.png
+            import importlib.resources as resources
+            asset_path = resources.files(
+                "gymnasium.envs.classic_control"
+            ).joinpath("assets/clockwise.png")
+            img = pygame.image.load(str(asset_path))
+        except (FileNotFoundError, ModuleNotFoundError, pygame.error):
+            # No asset?  No worries — just omit the arrow.
+            img = None
+
+        if img is not None and self.last_u is not None:
+            arrow = pygame.transform.smoothscale(
+                img,
+                (
+                    scale * abs(self.last_u) / 2,
+                    scale * abs(self.last_u) / 2,
+                ),
+            )
+            arrow = pygame.transform.flip(arrow, self.last_u > 0, True)
+            self.surf.blit(
+                arrow,
+                (
+                    offset - arrow.get_rect().centerx,
+                    offset - arrow.get_rect().centery,
+                ),
+            )
+        # Axle cap
+        gfxdraw.aacircle(self.surf, offset, offset, int(0.05 * scale), (0, 0, 0))
+        gfxdraw.filled_circle(self.surf, offset, offset, int(0.05 * scale), (0, 0, 0))
+
+        # Flip Y-axis (pygame’s origin is top-left)
+        self.surf = pygame.transform.flip(self.surf, False, True)
+        self.screen.blit(self.surf, (0, 0))
+
+        if self.render_mode == "human":
+            pygame.event.pump()
+            self.clock.tick(self.metadata["render_fps"])
+            pygame.display.flip()
+        else:                                             # "rgb_array"
+            return np.transpose(
+                np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2)
+            )
 
 
 class CustomAcrobotEnv(TimeLimitMixin, AcrobotEnv):
