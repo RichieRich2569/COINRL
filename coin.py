@@ -268,11 +268,14 @@ class COIN:
         self.fig_dir = fig_dir
         
     def simulate_coin(self):
+        """Entrance point for COIN simulation. Given perturbations, simulate state feedback and the COIN updates."""
         if self.cues is not None:
             self.check_cue_labels()
         
+        # Requires perturbations to be defined - our generation point for state feedback
         assert self.perturbations is not None, "perturbations unfound!"
         
+        # Temp will store our simulation results
         temp = []
         
         # set the store property based on the plot flags
@@ -282,10 +285,12 @@ class COIN:
         num_trials = len(self.perturbations)
         
         if (self.adaptation is None) or (len(self.adaptation) == 0):
+            # No adaptation data provided
             trials = np.arange(num_trials)
             
             print("Simulating the COIN model")
             
+            # Set up for multiple runs - using parallel processing if max_cores > 0
             parallel_coin_main_loop = lambda n: self.coin_main_loop(trials)["stored"]
             
             if self.max_cores > 0:
@@ -298,9 +303,11 @@ class COIN:
                         coin_state = self.coin_main_loop(trials)
                         temp.append(coin_state["stored"])
 
+            # Equal weights for each run - for future averaging
             w = np.ones(self.runs) / self.runs
             
         else:
+            # Adaptation provided
             if len(self.adaptation) != len(self.perturbations):
                 raise ValueError("Property ``adaptation'' should be a vector with one element per trial (use nan on trials where adaptation is not measured).")
 
@@ -375,6 +382,7 @@ class COIN:
         S["weights"] = w
         S["properties"] = self
         
+        # Store all resulting plots
         properties = list(self.__dict__.keys())
         for i in range(len(properties)):
             if "plot" in properties[i]:
@@ -385,6 +393,9 @@ class COIN:
         return S    
         
     def coin_main_loop(self, trials: int, coin_state: Optional[Dict[str, Any]]=None):
+        """Main loop of the COIN model.
+        Initialise the model if starting from trial 0, otherwise:
+        1. Predict"""
         if trials[0] == 0:
             coin_state = self.initialise_coin()
         for trial in trials:
@@ -464,6 +475,7 @@ class COIN:
     
     def predict_context(self, coin_state: Dict[str, Any]):
         if (coin_state["trial"]-1) in self.stationary_trials:
+            # Set predicted probabilities to stationary probabilities
             for p in range(self.particles):
                 C = np.sum(coin_state["local_transition_matrix"][:, 0, p] > 0)
                 transmat = coin_state["local_transition_matrix"][:C, :C, p]
@@ -471,7 +483,7 @@ class COIN:
         else:
             prior_probabilities = np.zeros((self.max_contexts+1, self.particles))
             
-            inds_1 = np.tile(coin_state["context"][None], (self.max_contexts+1, 1)) - 1 # TODO: is the -1 right?
+            inds_1 = np.tile(coin_state["context"][None], (self.max_contexts+1, 1)) - 1
             inds_2 = np.tile(np.arange(self.max_contexts+1)[None], (self.particles, 1)).T
             inds_3 = np.tile(np.arange(self.particles)[None], (self.max_contexts+1, 1))
             for i in range(self.max_contexts+1):
@@ -481,14 +493,6 @@ class COIN:
                     ]
             
             coin_state["prior_probabilities"] = prior_probabilities
-            
-            # TODO: verify if the following vectorised version works
-            
-            # inds_1 = np.tile(coin_state["context"][None], (self.max_contexts+1, 1)).ravel()
-            # inds_2 = np.tile(np.arange(self.max_contexts+1)[:, None], (1, self.particles)).ravel()
-            # inds_3 = np.tile(np.arange(self.particles)[None], (self.max_contexts+1, 1)).ravel()
-
-            # coin_state["prior_probabilities"] = coin_state["local_transition_matrix"][inds_1, inds_2, inds_3].reshape(self.max_contexts+1, self.particles)
 
         if coin_state["cues_exist"]:
             cue_probabilities = np.zeros((self.max_contexts+1, self.particles))
@@ -810,6 +814,12 @@ class COIN:
         return coin_state
         
     def check_cue_labels(self):
+        """Cue labels must be numbered as set by experimentation procedure. This means:
+        - Firstly, we must have perturbations defined (cues do not exist by themselves);
+        - The first cue must be labelled as 1;
+        - Cues must show up in ascending order, i.e., if cue 3 shows up, then cue 2 must have shown up before.
+        In case these are not satisfied, cues are renumbered according to the order they are presented.
+        """
         assert self.perturbations is not None
         
         num_trials = len(self.perturbations)
@@ -825,6 +835,9 @@ class COIN:
                     break
     
     def renumber_cues(self):
+        """Renumber cues according to the order they are presented in the experiments.
+        They are numbered starting from 1, in ascending order such that if cue x shows up, then cues x-1,x-2,...,1 must have shown up before.
+        """
         cue_order = np.unique(self.cues)
         
         if self.cues.ndim == 1:
@@ -1098,6 +1111,7 @@ class COIN:
         return coin_state
     
     def set_store_property_for_plots(self):
+        """Set the 'store' property to contain necessary variables for plotting, according to the boolean plot properties set by the user."""
         temp = []
         if self.plot_state_given_context:
             temp.extend(["state_mean", "state_var"])
