@@ -935,7 +935,7 @@ class COIN:
             )
             
             # sample beta_e (for cue CRF)
-            coin_state["global_cue_posterior"] = np.reshape(np.sum(coin_state["m_cue"], axis=0), (self.cues+1, self.particles))
+            coin_state["global_cue_posterior"] = np.reshape(np.sum(coin_state["m_cue"], axis=0), (np.max(self.cues)+1, self.particles))
             coin_state["global_cue_posterior"][coin_state["Q"]+1, :] = self.gamma_cue
             
             coin_state["global_cue_probabilities"] = random_dirichlet(coin_state["global_cue_posterior"])
@@ -1020,7 +1020,7 @@ class COIN:
             self.prior_precision_bias * bias_mean + coin_state["bias_ss_1"] / (coin_state["sigma_observation_noise"] ** 2)
         )
         
-        coin_state["bias"] = random_univariate_normal(coin_state["bias_mean"], coin_state["bias_var"])
+        coin_state["bias"] = random_univariate_normal(coin_state["bias_mean"], coin_state["bias_var"], self.particles, self.max_contexts)
         
         return coin_state
     
