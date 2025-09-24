@@ -286,20 +286,21 @@ class COIN_RT(coin.COIN):
             self.coin_state["feedback_observed"] = temp
 
             # Particle learning step
-            coin_state = self.predict_context(self.coin_state, cue)
-            coin_state = self.predict_states(self.coin_state)
-            coin_state = self.predict_state_feedback(self.coin_state, state_feedback) # RT-specific, state feedback now external input
-            coin_state = self.resample_particles(self.coin_state)
-            coin_state = self.sample_context(self.coin_state, cue)
-            coin_state = self.update_belief_about_states(self.coin_state)
-            coin_state = self.sample_states(self.coin_state)
-            coin_state = self.update_sufficient_statistics_for_parameters(self.coin_state, cue)
-            coin_state = self.sample_parameters(self.coin_state)
-            coin_state = self.store_variables(self.coin_state)
+            cs = self.coin_state # shorthand, changes will be reflected in self.coin_state
+            cs = self.predict_context(cs, cue)
+            cs = self.predict_states(cs)
+            cs = self.predict_state_feedback(cs, state_feedback) # RT-specific, state feedback now external input
+            cs = self.resample_particles(cs)
+            cs = self.sample_context(cs, cue)
+            cs = self.update_belief_about_states(cs)
+            cs = self.sample_states(cs)
+            cs = self.update_sufficient_statistics_for_parameters(cs, cue)
+            cs = self.sample_parameters(cs)
+            cs = self.store_variables(cs)
 
             S = {}
             S["runs"] = {}
-            S["runs"][0] = coin_state["stored"]
+            S["runs"][0] = cs["stored"]
             S["weights"] = np.ones((self.runs, )) / self.runs
             S["properties"] = self
             

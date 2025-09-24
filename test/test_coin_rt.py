@@ -113,7 +113,7 @@ def test_reinitialise_toggles_cue_fields_and_resets_bookkeeping():
 
     # Bookkeeping reset by initialise_coin
     assert model.perturbations == []
-    assert model.cues is None
+    assert model.cues == [2] # cues list is empty list + maximum number of cues
 
     # Re-initialise again with cues_exist=False (cue fields should disappear)
     cs3 = model.initialise_coin(cues_exist=False)
@@ -524,8 +524,8 @@ def test_step_end_to_end_smoke_with_cues(monkeypatch, model_with_cues):
     """
     m = model_with_cues
     m.runs = 3
-    # Ensure cues list exists (current implementation sets None)
-    m.cues = []
+    # Ensure cues list exists (current implementation sets to max_cues)
+    m.cues = [m.max_cues]
 
     C = m.max_contexts + 1
     P = m.particles
@@ -621,40 +621,149 @@ def test_initial_cues_container_is_a_list_when_cues_exist(model_with_cues):
 # ---------------------------------------------------------------------
 # 9) End-to-end equivalence with batch simulation given same feedback
 # ---------------------------------------------------------------------
-@pytest.mark.slow
-def test_rt_matches_batch_simulation_given_same_feedback():
+    
+def test_rt_matches_batch_simulation_single_step():
     """
-    Verify that COIN_RT.step run across many trials produces identical motor_output
-    to coin.COIN.simulate_coin, when fed the exact same state_feedback sequence
-    and with identical random seeds / hyperparameters.
+    Verify COIN_RT.step produces identical motor_output as coin.COIN.simulate_coin
+    under identical feedback, seeds, and hyperparameters for a single step.
+    """
 
-    Steps:
-      1) Build a COIN model, set a perturbation schedule (with channel trials),
-         seed RNG, and run simulate_coin().
-      2) Extract the generated state_feedback (y_t) sequence from the COIN output.
-      3) Build a COIN_RT model with identical hyperparameters, re-seed RNG,
-         and call step() once per trial using y_t from (2).
-      4) Compare output["runs"][0]["motor_output"] arrays from both models.
-    """
     coin, coin_rt = import_modules()
 
-    # Shared hyperparameters for both models (match COIN_RT defaults)
     common_kwargs = dict(
-        particles=5,   # keep test snappy
+        particles=5,
         max_contexts=10,
     )
 
-    # 1) Batch simulation with coin.COIN
-    # Perturbation schedule (lots of trials + channel trials with NaNs)
-    perturbations = np.concatenate([
-        np.zeros((50,)),       # 50 null
-        np.ones((125,)),       # 125 P+
-        -np.ones((15,)),       # 15 P-
-        np.ones((150,)) * np.nan,  # 150 channel trials (no feedback)
-    ]).astype(float)
+    if not hasattr(coin.COIN, "simulate_coin"):
+        pytest.skip("coin.COIN.simulate_coin() not available in this environment.")
+
+    SEED = 12345
+
+    np.random.seed(SEED)
+    rt_model = coin_rt.COIN_RT(**common_kwargs, cues_exist=False)
+    
+    # Simulation directly from coin.coin_main_loop
+    np.random.seed(SEED)
+    coin_model = coin.COIN(**common_kwargs)
+    coin_model.perturbations = np.zeros((1, ))
+    trials = np.arange(0, 1)
+    out_state = coin_model.coin_main_loop(trials)
+
+    y_out = np.asarray(out_state["state_feedback"])
+    mo_batch = np.asarray(out_state["motor_output"])
+
+    # --- Realtime simulation ---
+
+    rt_model.coin_state.setdefault("trial", 0)
+    if "feedback_observed" not in rt_model.coin_state:
+        rt_model.coin_state["feedback_observed"] = []
+
+    y_in = np.nan if np.isnan(y_out) else float(y_out)
+    last_res = rt_model.step(state_feedback=y_in, cue=None)
+
+    mo_rt = np.asarray(last_res["runs"][0]["motor_output"])
+
+    # --- Compare outputs ---
+    np.testing.assert_allclose(mo_rt, mo_batch, rtol=0, atol=1e-12)
+
+def test_rt_matches_batch_simulation_multiple_steps():
+    """
+    Verify COIN_RT.step produces identical motor_output as coin.COIN.simulate_coin
+    under identical feedback, seeds, and hyperparameters for multiple steps.
+    """
+
+    coin, coin_rt = import_modules()
+
+    common_kwargs = dict(
+        particles=5,
+        max_contexts=10,
+    )
+
+    if not hasattr(coin.COIN, "simulate_coin"):
+        pytest.skip("coin.COIN.simulate_coin() not available in this environment.")
+
+    SEED = 12345
+
+    np.random.seed(SEED)
+    rt_model = coin_rt.COIN_RT(**common_kwargs, cues_exist=False)
+    
+    # Simulation directly from coin.coin_main_loop
+    np.random.seed(SEED)
+    coin_model = coin.COIN(**common_kwargs)
+    coin_model.perturbations = np.zeros((5, ))
+    y_out = np.zeros((5, ))
+    mo_batch = np.zeros((5, ))
+    trials = np.arange(0, 5)
+
+    for t in trials:
+       out_state = coin_model.coin_main_loop(np.array([t]), coin_state=out_state if t > 0 else None)
+       y_out[t] = np.asarray(out_state["state_feedback"])
+       mo_batch[t] = np.asarray(out_state["motor_output"])
+
+    # --- Realtime simulation ---
+
+    rt_model.coin_state.setdefault("trial", 0)
+    if "feedback_observed" not in rt_model.coin_state:
+        rt_model.coin_state["feedback_observed"] = []
+
+    for t in range(5):
+        yt = y_out[t]
+        y_in = np.nan if np.isnan(yt) else float(yt)
+        last_res = rt_model.step(state_feedback=y_in, cue=None)
+
+    mo_rt = np.asarray(last_res["runs"][0]["motor_output"])
+
+    # --- Compare outputs ---
+    np.testing.assert_allclose(mo_rt, mo_batch, rtol=0, atol=1e-12)
+
+
+def _make_perturbations(kind: str):
+    """Utility to generate perturbation schedules."""
+    if kind == "single":
+        # Very short, one step schedule
+        return np.zeros((1,))
+    elif kind == "medium":
+        # Moderate schedule with a few dozen trials
+        return np.concatenate([
+            np.zeros(5),
+            np.ones(5),
+            -np.ones(3),
+            np.ones(5) * np.nan,
+        ]).astype(float)
+    elif kind == "complex":
+        # Long schedule
+        return np.concatenate([
+            np.zeros((50,)),        # 50 null
+            np.ones((125,)),        # 125 P+
+            -np.ones((15,)),        # 15 P-
+            np.ones((150,)) * np.nan,  # 150 channel trials
+        ]).astype(float)
+    else:
+        raise ValueError(f"Unknown perturbation kind {kind}")
+
+@pytest.mark.parametrize(
+    "perturb_kind",
+    ["single", "medium", pytest.param("complex", marks=pytest.mark.slow)]
+)
+def test_rt_matches_batch_simulation_given_same_feedback(perturb_kind):
+    """
+    Verify COIN_RT.step produces identical motor_output as coin.COIN.simulate_coin
+    under identical feedback, seeds, and hyperparameters for a variety of perturbation schedules.
+    This uses the full external view of both models.
+    """
+
+    coin, coin_rt = import_modules()
+
+    common_kwargs = dict(
+        particles=5,
+        max_contexts=10,
+        max_cores=0,
+    )
+
+    perturbations = _make_perturbations(perturb_kind)
     T = perturbations.shape[0]
 
-    # Ensure simulate_coin exists
     if not hasattr(coin.COIN, "simulate_coin"):
         pytest.skip("coin.COIN.simulate_coin() not available in this environment.")
 
@@ -707,3 +816,328 @@ def test_rt_matches_batch_simulation_given_same_feedback():
     # 3) Compare the two motor_output sequences
     # Use tight tolerances (these should be identical given seed and same observations)
     np.testing.assert_allclose(mo_rt, mo_batch, rtol=0, atol=1e-12)
+
+# =====================================================================
+# Structured consistency tests: COIN_RT overridden methods vs COIN
+# Ensures child outputs match super() outputs under identical state/seed
+# Paste this block at the END of test_coin_rt.py
+# =====================================================================
+
+import numpy as np
+import pytest
+
+# --- Fixtures & helpers --------------------------------------------------------
+
+@pytest.fixture
+def modules():
+    """
+    Reuse your existing import helper if present; otherwise fall back.
+    Must yield (coin_module, coin_rt_module).
+    """
+    try:
+        # Prefer the project's helper if defined above in this file:
+        coin, coin_rt = import_modules()  # noqa: F821  (defined earlier in your file)
+    except NameError:
+        import importlib
+        coin = importlib.import_module("coin")
+        coin_rt = importlib.import_module("coin_rt")
+    return coin, coin_rt
+
+
+@pytest.fixture
+def fresh_models(modules):
+    """
+    Construct matched parent/child models with the same sizes and neutral hooks.
+    """
+    coin, coin_rt = modules
+    parent = coin.COIN(particles=7, max_contexts=5)          # small but nontrivial sizes
+    child  = coin_rt.COIN_RT(particles=7, max_contexts=5, max_cues=4)
+    # avoid any special side effects from store hooks unless explicitly set
+    parent.store = []
+    child.store = []
+    return parent, child
+
+
+@pytest.fixture
+def seeded():
+    """
+    Deterministic numpy + RandomState for generating the same inputs every time.
+    Usage: rs = seeded(123)
+    """
+    def _mk(seed=123):
+        np.random.seed(seed)
+        try:
+            # If your file defines _rng helper earlier, use it for parity with other tests
+            rs = _rng(seed)  # noqa: F821
+        except NameError:
+            rs = np.random.RandomState(seed)
+        return rs
+    return _mk
+
+
+def _dcopy(d: dict) -> dict:
+    """Shallow dict copy with np.ndarray copied by value."""
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, np.ndarray):
+            out[k] = v.copy()
+        else:
+            out[k] = v
+    return out
+
+
+# --- Parity tests for overridden methods ---------------------------------------
+# Overridden in COIN_RT (based on coin_rt.py): 
+#   __init__, initialise_coin, step, predict_context, predict_state_feedback,
+#   sample_context, update_sufficient_statistics_for_parameters,
+#   update_sufficient_statistics_global_cue_probabilities, store_function
+#
+# We test parity for all logic-returning ones (not constructor), and skip store_function
+# (it’s purely a side-effect hook) and __init__.
+
+
+# 1) initialise_coin parity (both cues_exist=False and True)
+def test_initialise_coin_parity(fresh_models):
+    parent, child = fresh_models
+
+    # ---- cues_exist = False
+    np.random.seed(0)
+    parent.perturbations = np.zeros((4,))
+    cs_p0 = parent.initialise_coin() # Initialisation cannot happen without perturbations
+    np.random.seed(0)
+    cs_c0 = child.initialise_coin(cues_exist=False)
+
+    for k in ("trial", "context", "C"):
+        assert k in cs_p0 and k in cs_c0
+        assert np.all(cs_p0[k] == cs_c0[k])
+
+    # ---- cues_exist = True
+    np.random.seed(1)
+    parent.cues = np.arange(1, 5, dtype=int) # We now need cues for initialisation
+    cs_p1 = parent.initialise_coin()
+    np.random.seed(1)
+    cs_c1 = child.initialise_coin(cues_exist=True)
+
+    for k in ("trial", "context", "C", "Q"):
+        assert k in cs_p1 and k in cs_c1
+        assert np.all(cs_p1[k] == cs_c1[k])
+
+
+# 2) predict_context parity (no cues branch)
+def test_predict_context_parity_no_cues(fresh_models, seeded):
+    parent, child = fresh_models
+    rs = seeded(2025)
+    C = parent.max_contexts + 1
+    P = parent.particles
+
+    coin_state = dict(
+        cues_exist=0,
+        trial=1,
+        context=rs.randint(1, C, size=(P,), dtype=int),
+        local_transition_matrix=rs.rand(C, C, P),
+    )
+
+    out_p = parent.predict_context(_dcopy(coin_state))
+    out_c = child.predict_context(_dcopy(coin_state), cue=None)
+
+    # In the no-cue path, child's predicted == parent's prior (same math)
+    np.testing.assert_allclose(out_c["prior_probabilities"], out_p["prior_probabilities"])
+    np.testing.assert_allclose(out_c["predicted_probabilities"], out_p["prior_probabilities"])
+
+
+# 3) predict_context parity (with cue branch)
+def test_predict_context_parity_with_cue(fresh_models, seeded):
+    parent, child = fresh_models
+    rs = seeded(7)
+    C = parent.max_contexts + 1
+    P = parent.particles
+    Qmax = child.max_cues + 1
+    cue = 2  # any valid cue label (1..Qmax-1)
+
+    coin_state = dict(
+        cues_exist=1,
+        trial=1,
+        context=rs.randint(1, C, size=(P,), dtype=int),
+        local_transition_matrix=rs.rand(C, C, P),
+        local_cue_matrix=rs.rand(C, Qmax, P),
+    )
+
+    # Parent obtains cue via self.cues[trial-1], so set it
+    parent.cues = np.array([cue], dtype=int)
+
+    out_p = parent.predict_context(_dcopy(coin_state))
+    out_c = child.predict_context(_dcopy(coin_state), cue=cue)
+
+    for k in ("prior_probabilities", "cue_probabilities", "predicted_probabilities"):
+        assert k in out_p and k in out_c
+        np.testing.assert_allclose(out_c[k], out_p[k])
+
+
+# 4) predict_state_feedback parity (shared, noise-free quantities)
+def test_predict_state_feedback_parity(fresh_models):
+    parent, child = fresh_models
+    C = parent.max_contexts + 1
+    P = parent.particles
+
+    parent.perturbations = np.zeros((3,)) # we need this defined for the parent
+
+    # ensure both compute 'implicit' if that path is enabled
+    parent.store = ["implicit"]
+    child.store = ["implicit"]
+
+    coin_state = dict(
+        trial = 1, # needed for parent predict_state_feedback
+        predicted_probabilities=np.ones((C, P)) / C,
+        state_mean=np.full((C, P), 0.3),
+        bias=np.full((C, P), 0.1),
+        state_var=np.full((C, P), 0.04),
+        sigma_observation_noise=np.full((C, P), 0.2),
+        average_state=0.25,
+    )
+
+    out_p = parent.predict_state_feedback(_dcopy(coin_state))
+    # child takes same state_feedback as generated by parent
+    sf = out_p["state_feedback"]
+    out_c = child.predict_state_feedback(_dcopy(coin_state), state_feedback=sf)
+
+    for k in ("state_feedback_mean", "state_feedback_var", "motor_output", "implicit"):
+        assert k in out_p and k in out_c
+        np.testing.assert_allclose(out_c[k], out_p[k])
+
+
+# 5) sample_context parity (ensure no-new-cue path matches)
+def test_sample_context_parity_existing_cue(fresh_models, seeded):
+    parent, child = fresh_models
+    rs = seeded(77)
+    C = parent.max_contexts + 1
+    P = parent.particles
+
+    # responsibilities: normalized over contexts per particle
+    R = np.zeros((C, P))
+    R[0:2, :] = rs.rand(2, P)
+    R /= np.sum(R, axis=0, keepdims=True)
+
+    # Global Transition Probabilities must be correctly defined
+    gqp = np.zeros((C, P))
+    gqp[0:2, :] = rs.rand(2, P)
+    gqp /= np.sum(gqp, axis=0, keepdims=True)
+
+    coin_state = dict(
+        cues_exist=1,
+        trial=1,
+        responsibilities=R,
+        context=np.ones((P,), dtype=int),
+        C=np.ones((P,), dtype=int),
+        global_transition_probabilities=gqp,
+        Q=1,  # already saw cue '1'
+        global_cue_probabilities=np.zeros((child.max_cues + 2, P)),
+    )
+
+    cue = 1  # same as existing (forces "existing cue" path, not "new cue")
+    parent.cues = np.array([cue], dtype=int)
+
+    np.random.seed(123)
+    out_p = parent.sample_context(_dcopy(coin_state))
+
+    np.random.seed(123)
+    out_c = child.sample_context(_dcopy(coin_state), cue=cue)
+
+    np.testing.assert_array_equal(out_c["context"], out_p["context"])
+    np.testing.assert_array_equal(out_c["C"], out_p["C"])
+    np.testing.assert_allclose(
+        out_c["global_transition_probabilities"], out_p["global_transition_probabilities"]
+    )
+
+
+# 6) update_sufficient_statistics_global_cue_probabilities parity
+def test_update_stats_global_cue_probabilities_parity(fresh_models):
+    parent, child = fresh_models
+    P = parent.particles
+    C = parent.max_contexts + 1
+    Qmax = child.max_cues + 1
+    cue = 3
+
+    coin_state = dict(
+        context=np.full((P,), 2, dtype=int),               # all particles in context 2
+        n_cue=np.zeros((C, Qmax, P), dtype=int),
+        trial=0
+    )
+
+    parent.cues = np.array([cue], dtype=int)
+
+    out_p = parent.update_sufficient_statistics_global_cue_probabilities(_dcopy(coin_state))
+    out_c = child.update_sufficient_statistics_global_cue_probabilities(_dcopy(coin_state), cue=cue)
+
+    np.testing.assert_array_equal(out_c["n_cue"], out_p["n_cue"])
+
+
+# 7) update_sufficient_statistics_for_parameters dispatch parity
+def test_update_stats_for_parameters_dispatch_parity(fresh_models, monkeypatch):
+    parent, child = fresh_models
+    parent.infer_bias = True
+    child.infer_bias = True
+
+    calls_p = dict(gtp=0, gcp=0, dyn=0, bias=0)
+    calls_c = dict(gtp=0, gcp=0, dyn=0, bias=0)
+
+    # Parent spies
+    def _gtp_p(cs): calls_p.__setitem__("gtp", calls_p["gtp"] + 1); return cs
+    def _gcp_p(cs): calls_p.__setitem__("gcp", calls_p["gcp"] + 1); return cs
+    def _dyn_p(cs): calls_p.__setitem__("dyn", calls_p["dyn"] + 1); return cs
+    def _bias_p(cs): calls_p.__setitem__("bias", calls_p["bias"] + 1); return cs
+
+    # Child spies (note child gcp takes a cue arg)
+    def _gtp_c(cs): calls_c.__setitem__("gtp", calls_c["gtp"] + 1); return cs
+    def _gcp_c(cs, cue): 
+        assert cue == 2
+        calls_c.__setitem__("gcp", calls_c["gcp"] + 1); 
+        return cs
+    def _dyn_c(cs): calls_c.__setitem__("dyn", calls_c["dyn"] + 1); return cs
+    def _bias_c(cs): calls_c.__setitem__("bias", calls_c["bias"] + 1); return cs
+
+    # Patch parent
+    monkeypatch.setattr(parent, "update_sufficient_statistics_global_transition_probabilities", _gtp_p, raising=True)
+    monkeypatch.setattr(parent, "update_sufficient_statistics_global_cue_probabilities", _gcp_p, raising=True)
+    monkeypatch.setattr(parent, "update_sufficient_statistics_dynamics", _dyn_p, raising=True)
+    monkeypatch.setattr(parent, "update_sufficient_statistics_bias", _bias_p, raising=True)
+
+    # Patch child
+    monkeypatch.setattr(child, "update_sufficient_statistics_global_transition_probabilities", _gtp_c, raising=True)
+    monkeypatch.setattr(child, "update_sufficient_statistics_global_cue_probabilities", _gcp_c, raising=True)
+    monkeypatch.setattr(child, "update_sufficient_statistics_dynamics", _dyn_c, raising=True)
+    monkeypatch.setattr(child, "update_sufficient_statistics_bias", _bias_c, raising=True)
+
+    # Equivalent coin_state; parent fetches cue from self.cues, child gets explicit cue
+    coin_state = dict(
+        cues_exist=1,
+        trial=2,                       # >1 triggers dynamics path
+        feedback_observed=[True, True] # trial-1 index -> True triggers bias path
+    )
+    parent.cues = np.array([2], dtype=int)
+
+    parent.update_sufficient_statistics_for_parameters(_dcopy(coin_state))
+    child.update_sufficient_statistics_for_parameters(_dcopy(coin_state), cue=2)
+
+    assert calls_p == dict(gtp=1, gcp=1, dyn=1, bias=1)
+    assert calls_c == dict(gtp=1, gcp=1, dyn=1, bias=1)
+
+
+# --- Ensure the "matches/batch simulation" parity runs last --------------------
+# If your suite defines a helper or a specific test for batch parity (e.g. 
+# matches_batch_simulation() or test_rt_matches_batch_simulation_given_same_feedback),
+# we trigger it here so it executes at the end of this file.
+
+def test_zz_run_matches_batch_simulation_if_present():
+    # Try a helper named `matches_batch_simulation` first
+    g = globals()
+    if "matches_batch_simulation" in g and callable(g["matches_batch_simulation"]):
+        g["matches_batch_simulation"]()
+        return
+
+    # Otherwise, try to call an existing test if it exists in this module
+    if "test_rt_matches_batch_simulation_given_same_feedback" in g and callable(g["test_rt_matches_batch_simulation_given_same_feedback"]):
+        # Call the existing test function directly (re-uses its own internals/fixtures)
+        g["test_rt_matches_batch_simulation_given_same_feedback"]()  # type: ignore
+        return
+
+    pytest.skip("No batch/matches simulation function found in this file.")

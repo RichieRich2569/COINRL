@@ -1085,7 +1085,7 @@ class COIN:
     
     def update_sufficient_statistics_global_cue_probabilities(self, coin_state: Dict[str, Any]):
         inds_1 = coin_state["context"] - 1 # TODO: is the -1 right?
-        inds_2 = self.cues[coin_state["trial"]-1] * np.ones((self.particles, ))
+        inds_2 = self.cues[coin_state["trial"]-1] * np.ones((self.particles, ), dtype=int)
         inds_3 = np.arange(self.particles)
         
         for i in range(self.particles):
