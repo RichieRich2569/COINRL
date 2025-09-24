@@ -9,7 +9,6 @@ It contains:
 ├── coin.py                   # COIN particle-filter implementation (by Changmin Yu)
 ├── environments.py           # parametrisable Gymnasium envs (custom)
 ├── rl.py                     # tabular & contextual Q-learning agents
-├── basics.ipynb              # quick smoke-test notebook
 ├── figures.ipynb             # reproduces all paper figures
 ├── utils/
 │   ├── clustering.py

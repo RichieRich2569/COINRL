@@ -28,6 +28,8 @@ from typing import Optional, List, Dict, Any
 
 import os
 
+from time import perf_counter   
+
 import numpy as np
 
 from scipy.stats import norm
@@ -293,10 +295,16 @@ class COIN:
                     results = pool.map(parallel_coin_main_loop, range(self.runs))
                 temp = results
             else:
+                elapsed = 0.0
                 with trange(self.runs, dynamic_ncols=True) as pbar:
                     for n in pbar:
+                        t0 = perf_counter()
                         coin_state = self.coin_main_loop(trials)
+                        elapsed += perf_counter() - t0
                         temp.append(coin_state["stored"])
+
+                avg_call_time = elapsed / trials[-1] * 1000  # Convert to milliseconds
+                print(f"Average coin_main_loop time: {avg_call_time:.4f} ms")
 
             w = np.ones(self.runs) / self.runs
             
@@ -399,7 +407,7 @@ class COIN:
             coin_state = self.update_sufficient_statistics_for_parameters(coin_state)
             coin_state = self.sample_parameters(coin_state)
             coin_state = self.store_variables(coin_state)
-        
+
         return coin_state
     
     def initialise_coin(self):
