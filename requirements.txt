@@ -14,3 +14,7 @@ multiprocess>=0.70   # parallel particle filtering in coin.py :contentReference[
 # Jupyter
 jupyterlab>=4.1  # full web UI; brings in notebook 7.x
 ipykernel>=6.29  # kernel that drives *.ipynb cells
+ipywidgets>=8.0  # interactive widgets in notebooks
+
+# Testing
+pytest>=7.4    # unit tests
