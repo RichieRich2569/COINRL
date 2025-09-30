@@ -258,8 +258,9 @@ class COIN_RT(coin.COIN):
                 A list of dictionaries containing results for each run.
             """
             # TODO: handle multiple runs
-            # Increment trial
+            # Increment trial and num_trials
             self.coin_state["trial"] += 1
+            self.coin_state["num_trials"] += 1
             trial = self.coin_state["trial"]
 
             # Check if cues are provided when cues_exist is True
@@ -388,8 +389,11 @@ class COIN_RT(coin.COIN):
             if "implicit" in self.store:
                 coin_state["implicit"] = coin_state["motor_output"] - coin_state["average_state"]
             
-            # state feedback
-            coin_state["state_feedback"] = state_feedback
+            # state feedback - consume the same number of randomisations as in the original COIN (for testing purposes)
+            coin_state["sensory_noise"] = self.sigma_sensory_noise * np.random.randn()
+            coin_state["motor_noise"]   = self.sigma_motor_noise   * np.random.randn()
+
+            coin_state["state_feedback"] = state_feedback # only this is necessary
             
             # state feedback prediction error
             coin_state["prediction_error"] = coin_state["state_feedback"] - coin_state["state_feedback_mean"]
