@@ -221,6 +221,10 @@ class COIN_RT(coin.COIN):
             # Initialise coin
             self.coin_state = self.initialise_coin(cues_exist=cues_exist)
 
+            # Perturbations
+            self.perturbations = np.array([]) # This array is not used in COIN-RT, but its size is 
+            # incremented every step to keep compatibility.
+
         def initialise_coin(self, cues_exist: bool):
             """Initialise the COIN model state."""
             self.perturbations = []
@@ -258,10 +262,18 @@ class COIN_RT(coin.COIN):
                 A list of dictionaries containing results for each run.
             """
             # TODO: handle multiple runs
-            # Increment trial and num_trials
+            # Increment trial and num_trials as well as size of perturbations
             self.coin_state["trial"] += 1
             self.coin_state["num_trials"] += 1
             trial = self.coin_state["trial"]
+            # Ensure perturbations is a 1-D numpy array and extend its length by 1
+            p = np.asarray(self.perturbations)
+            if p.ndim > 1:
+                p = p.reshape(-1)
+            else:
+                p = p.copy()
+            p = p.astype(float) if p.size else p
+            self.perturbations = np.append(p, np.nan)
 
             # Check if cues are provided when cues_exist is True
             if self.coin_state["cues_exist"] and cue is None:
@@ -282,7 +294,7 @@ class COIN_RT(coin.COIN):
             # Feedback observed or not
             temp = np.ones((trial, ))
             temp[:trial-1] = self.coin_state["feedback_observed"]
-            if state_feedback is np.nan:
+            if np.isnan(state_feedback):
                 temp[-1] = 0
             self.coin_state["feedback_observed"] = temp
 
@@ -299,13 +311,44 @@ class COIN_RT(coin.COIN):
             cs = self.sample_parameters(cs)
             cs = self.store_variables(cs)
 
+            S = self._build_output()
+            
+            return S
+        
+        def get_predicted_probabilities(self):
+            # Get predicted probabilities p(c_t | y_{1:t-1}, ...) from model
+            #TODO: very inefficient, runs for all iterations. Optimise later.
+            S = self._build_output()
+            prob = super().get_predicted_probabilities(S)
+            return super().get_predicted_probabilities(S)
+        
+        def get_responsibilities(self, separate_novel: bool = True):
+            # Get responsibilities p(c_t | y_{1:t}, ...) from model
+            #TODO: very inefficient, runs for all iterations. Optimise later.
+            S = self._build_output()
+            known, novel = super().get_responsibilities(S)
+            if self.coin_state["trial"] > 0:
+                known = known[-1,:] # Get last trial only
+                novel = novel[-1,:] # Get last trial only
+            if separate_novel:
+                return known, novel
+            prob = np.concatenate([known, novel.reshape(1,1)], axis=1)
+            return prob
+        
+        def get_predicted_responsibilities(self, y):
+            # Get predicted responsibilities p(c_t | y_{1:t}, ...) for a given observation y
+            #TODO: very inefficient, runs for all iterations. Optimise later.
+            S = self._build_output()
+            return super().get_predicted_responsibilities(S, y)
+        
+        def _build_output(self):
+            # Build "output" structure for compatibility with original COIN
             S = {}
             S["runs"] = {}
-            S["runs"][0] = cs["stored"]
+            S["runs"][0] = self.coin_state["stored"]
             S["weights"] = np.ones((self.runs, )) / self.runs
             S["properties"] = self
-            
-            return S    
+            return S
         
         
         def predict_context(self, coin_state: Dict[str, Any], cue: Optional[int] = None) -> Dict[str, Any]:

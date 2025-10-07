@@ -5,6 +5,7 @@ This module contains various Reinforcement Learning (RL) algorithms and helper f
 intended for use with Gymnasium environments. It provides a template for integrating
 and organizing different RL methods in one place.
 """
+from __future__ import annotations
 
 import numpy as np
 import gymnasium as gym
@@ -12,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import defaultdict
-from typing import Dict, List, Tuple, Any
+from typing import Tuple, List, Optional, Union, Protocol, Dict, Any, runtime_checkable
 import copy
 
 
@@ -44,6 +45,106 @@ def discretize_state(
 
     return (pos_index, vel_index)
 
+#----- Exploration Strategies -----
+
+@runtime_checkable
+class ExplorationStrategy(Protocol):
+    """Interface for action selection during exploration."""
+    name: str
+
+    def select_action(
+        self,
+        q_values: np.ndarray,
+        action_space: gym.Space,
+        *,
+        epsilon_override: Optional[float] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> int:
+        ...
+
+    def on_episode_end(self) -> None:
+        """Hook to update internal schedules (e.g., decay)."""
+        ...
+
+
+class EpsilonGreedy(ExplorationStrategy):
+    """Classic epsilon-greedy with decay."""
+    def __init__(self, epsilon: float, decay: float, min_epsilon: float):
+        self.name = "epsilon_greedy"
+        self.epsilon = float(epsilon)
+        self.decay = float(decay)
+        self.min_epsilon = float(min_epsilon)
+
+    def select_action(
+        self,
+        q_values: np.ndarray,
+        action_space: gym.Space,
+        *,
+        epsilon_override: Optional[float] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> int:
+        rng = rng or np.random.default_rng()
+        eps = self.epsilon if epsilon_override is None else float(epsilon_override)
+        if rng.random() < eps:
+            return action_space.sample()
+        return int(np.argmax(q_values))
+
+    def on_episode_end(self) -> None:
+        self.epsilon = max(self.min_epsilon, self.epsilon * self.decay)
+
+
+class SoftmaxExploration(ExplorationStrategy):
+    """Boltzmann/Softmax over Q with temperature decay."""
+    def __init__(self, temperature: float = 1.0, decay: float = 0.999, min_temperature: float = 0.05):
+        self.name = "softmax"
+        self.temperature = float(temperature)
+        self.decay = float(decay)
+        self.min_temperature = float(min_temperature)
+
+    @staticmethod
+    def _softmax_logits(q_values: np.ndarray, temperature: float) -> np.ndarray:
+        # numerically-stable softmax
+        z = (q_values - np.max(q_values)) / max(temperature, 1e-8)
+        e = np.exp(z)
+        p = e / np.sum(e)
+        return p
+
+    def select_action(
+        self,
+        q_values: np.ndarray,
+        action_space: gym.Space,
+        *,
+        epsilon_override: Optional[float] = None,   # ignored for softmax
+        rng: Optional[np.random.Generator] = None,
+    ) -> int:
+        rng = rng or np.random.default_rng()
+        probs = self._softmax_logits(q_values, self.temperature)
+        return int(rng.choice(len(q_values), p=probs))
+
+    def on_episode_end(self) -> None:
+        self.temperature = max(self.min_temperature, self.temperature * self.decay)
+
+
+class RandomExploration(ExplorationStrategy):
+    """Pure random actions (mainly for debugging)."""
+    def __init__(self):
+        self.name = "random"
+
+    def select_action(
+        self,
+        q_values: np.ndarray,
+        action_space: gym.Space,
+        *,
+        epsilon_override: Optional[float] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> int:
+        return action_space.sample()
+
+    def on_episode_end(self) -> None:
+        pass
+
+
+# ---- Q-learning ----
 
 class QLearningAgent:
     """
@@ -61,6 +162,11 @@ class QLearningAgent:
         epsilon_decay: float = 0.999,
         min_epsilon: float = 0.01,
         init_Q_random: bool = True,
+        exploration: Union[str, ExplorationStrategy, None] = "epsilon_greedy",
+        softmax_temperature: float = 1.0,
+        softmax_decay: float = 0.999,
+        softmax_min_temperature: float = 0.05,
+        rng: Optional[np.random.Generator] = None,
     ):
         """
         Initialize the Q-learning agent with hyperparameters and bin settings.
@@ -71,20 +177,32 @@ class QLearningAgent:
             num_velocity_bins (int, optional): Number of bins for discretizing velocity.
             alpha (float, optional): Learning rate.
             gamma (float, optional): Discount factor.
-            epsilon (float, optional): Initial epsilon for -greedy strategy.
+            epsilon (float, optional): Initial epsilon for ε-greedy strategy.
             epsilon_decay (float, optional): Epsilon decay factor after each episode.
             min_epsilon (float, optional): Minimum value of epsilon.
-            init_Q_random (bool, optional): When True, initialise Q-table randomly, otherwise to zeros.
+            init_Q_random (bool, optional): Random-initialize Q-table if True, else zeros.
+            exploration (str|ExplorationStrategy|None): Which exploration strategy to use.
+                - "epsilon_greedy" (default, backward compatible)
+                - "softmax"
+                - "random"
+                - Or pass a custom ExplorationStrategy instance.
+            softmax_temperature/decay/min_temperature: params for softmax when selected.
+            rng: Optional numpy Generator for reproducibility.
         """
         self.num_position_bins = num_position_bins
         self.num_velocity_bins = num_velocity_bins
         self.alpha = alpha
         self.gamma = gamma
+
+        # Keep epsilon-related fields for backward compatibility & logging
         self.epsilon = epsilon
         self.epsilon_decay = epsilon_decay
         self.min_epsilon = min_epsilon
 
+        self.rng = rng or np.random.default_rng()
+
         # Extract state boundaries (assuming a 2D state: [position, velocity])
+        # Note: Adjust to your env if needed (e.g., env.observation_space.low/high)
         self.position_min, self.position_max = env.low[0], env.high[0]
         self.velocity_min, self.velocity_max = env.low[1], env.high[1]
 
@@ -101,20 +219,62 @@ class QLearningAgent:
         else:
             self.Q = np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions))
 
+        # Build exploration strategy (default is epsilon-greedy for compatibility)
+        self.strategy = self._build_strategy(
+            exploration=exploration,
+            epsilon=epsilon,
+            epsilon_decay=epsilon_decay,
+            min_epsilon=min_epsilon,
+            softmax_temperature=softmax_temperature,
+            softmax_decay=softmax_decay,
+            softmax_min_temperature=softmax_min_temperature,
+        )
+
+    @staticmethod
+    def _build_strategy(
+        exploration: Union[str, "ExplorationStrategy", None],
+        *,
+        epsilon: float,
+        epsilon_decay: float,
+        min_epsilon: float,
+        softmax_temperature: float,
+        softmax_decay: float,
+        softmax_min_temperature: float,
+    ) -> "ExplorationStrategy":
+        # If a custom strategy instance was passed, accept it
+        if isinstance(exploration, ExplorationStrategy):
+            return exploration  # type: ignore[return-value]
+
+        # Named strategies
+        if exploration is None or exploration == "epsilon_greedy":
+            return EpsilonGreedy(epsilon, epsilon_decay, min_epsilon)
+        if exploration == "softmax":
+            return SoftmaxExploration(
+                temperature=softmax_temperature,
+                decay=softmax_decay,
+                min_temperature=softmax_min_temperature,
+            )
+        if exploration == "random":
+            return RandomExploration()
+
+        raise ValueError(f"Unknown exploration type: {exploration!r}")
+
+    # -------- Policy & Learning --------
+
     def choose_action(self, env: gym.Env, state: Tuple[int, int], eps: float) -> int:
         """
-        Choose an action using an -greedy policy.
-
-        Args:
-            state (Tuple[int, int]): Discretized state indices.
-            eps (float): Epsilon value for exploration.
-
-        Returns:
-            int: Action chosen by the policy.
+        Choose an action using the configured exploration strategy.
+        - If using epsilon-greedy, we respect this 'eps' value at call-time.
+          For other strategies, 'eps' is safely ignored.
         """
-        if np.random.random() < eps:
-            return env.action_space.sample()
-        return np.argmax(self.Q[state])
+        q_row = self.Q[state]
+        # For epsilon-greedy, pass epsilon_override=eps, else ignored by strategy
+        return self.strategy.select_action(
+            q_row,
+            env.action_space,
+            epsilon_override=eps if isinstance(self.strategy, EpsilonGreedy) else None,
+            rng=self.rng,
+        )
 
     def update_q_table(
         self,
@@ -123,49 +283,31 @@ class QLearningAgent:
         reward: float,
         next_state: Tuple[int, int]
     ) -> None:
-        """
-        Update the Q-table using the Q-learning update rule.
-
-        Args:
-            state (Tuple[int, int]): Current discretized state indices.
-            action (int): Action taken.
-            reward (float): Reward received from the environment.
-            next_state (Tuple[int, int]): Next discretized state indices.
-        """
-        best_next_action = np.argmax(self.Q[next_state])
+        best_next_action = int(np.argmax(self.Q[next_state]))
         td_target = reward + self.gamma * self.Q[next_state][best_next_action]
         td_error = td_target - self.Q[state][action]
         self.Q[state][action] += self.alpha * td_error
 
     def train_step(
-            self,
-            env: gym.Env,
-            max_steps_per_episode: int = 200   
+        self,
+        env: gym.Env,
+        max_steps_per_episode: int = 200
     ) -> float:
         """
-        Train the Q-learning agent in its environment using an -greedy policy through one episode.
-
-        Args:
-            env (gym.Env): An initialized Gymnasium environment.
-            max_steps_per_episode (int, optional): Maximum steps to run in each episode.
+        Train the Q-learning agent for one episode using the configured exploration strategy.
 
         Returns:
-            float: 
-                - The total episode reward.
+            float: total episode reward
         """
         obs, _ = env.reset()
         state = discretize_state(obs, self.position_bins, self.velocity_bins)
         episode_reward = 0.0
 
         for _ in range(max_steps_per_episode):
-            # Choose action
-            action = self.choose_action(env, state, self.epsilon)
-
-            # Step in the environment
+            action = self.choose_action(env, state, self.epsilon)  # 'self.epsilon' maintained for compatibility
             next_obs, reward, done, truncated, _ = env.step(action)
             next_state = discretize_state(next_obs, self.position_bins, self.velocity_bins)
 
-            # Update Q-table
             self.update_q_table(state, action, reward, next_state)
 
             state = next_state
@@ -174,53 +316,49 @@ class QLearningAgent:
             if done or truncated:
                 break
 
-        # Epsilon decay
-        self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+        # Keep legacy epsilon fields in sync when using epsilon-greedy,
+        # so your existing logs/prints remain meaningful.
+        if isinstance(self.strategy, EpsilonGreedy):
+            self.strategy.on_episode_end()
+            self.epsilon = self.strategy.epsilon
+        else:
+            self.strategy.on_episode_end()
 
-        # End of training
         env.close()
         return episode_reward
 
     def train(
         self,
-        env : gym.Env,
+        env: gym.Env,
         n_episodes: int = 5000,
         max_steps_per_episode: int = 200,
         verbose: bool = False,
         print_freq: int = 200
     ) -> Tuple[np.ndarray, List[float]]:
         """
-        Train the Q-learning agent in its environment using an e-greedy policy.
-
-        Args:
-            n_episodes (int, optional): Number of training episodes.
-            max_steps_per_episode (int, optional): Maximum steps to run in each episode.
-            verbose (bool, optional): Whether to print intermediate training info.
-            print_freq (int, optional): Frequency for printing training progress.
-
-        Returns:
-            Tuple[np.ndarray, List[float]]:
-                - The learned Q-table.
-                - A list of accumulated rewards per episode.
+        Train the Q-learning agent (default epsilon-greedy; configurable).
         """
-        all_episode_rewards = []
+        all_episode_rewards: List[float] = []
 
         for episode in range(n_episodes):
-            # Train for the initial episode
             episode_reward = self.train_step(env, max_steps_per_episode)
-
             all_episode_rewards.append(episode_reward)
 
-            # Optional debug output
             if verbose and (episode + 1) % print_freq == 0:
-                avg_reward = np.mean(all_episode_rewards[-print_freq:])
+                avg_reward = float(np.mean(all_episode_rewards[-print_freq:]))
+                # Backward-compatible progress line
+                if isinstance(self.strategy, EpsilonGreedy):
+                    expline = f"Epsilon: {self.epsilon:.3f}"
+                elif isinstance(self.strategy, SoftmaxExploration):
+                    expline = f"Temp: {self.strategy.temperature:.3f}"
+                else:
+                    expline = f"Exploration: {self.strategy.name}"
                 print(
                     f"Episode: {episode + 1}, "
                     f"Avg Reward (last {print_freq}): {avg_reward:.2f}, "
-                    f"Epsilon: {self.epsilon:.3f}"
+                    f"{expline}"
                 )
 
-        # End of training
         env.close()
         return self.Q, all_episode_rewards
 
@@ -231,25 +369,18 @@ class QLearningAgent:
         max_steps_per_episode: int = 200
     ) -> List[float]:
         """
-        Execute the learned policy (greedy w.r.t. the Q-table) to evaluate performance.
+        Execute the greedy policy (argmax over Q) to evaluate performance.
         This method does not update the Q-table.
-
-        Args:
-            n_episodes (int, optional): Number of episodes to run for evaluation.
-            max_steps_per_episode (int, optional): Maximum steps to run in each episode.
-
-        Returns:
-            List[float]: Total rewards for each of the evaluation episodes.
         """
-        rewards = []
+        rewards: List[float] = []
         for _ in range(n_episodes):
             obs, _ = env.reset()
             state = discretize_state(obs, self.position_bins, self.velocity_bins)
             episode_reward = 0.0
 
             for _ in range(max_steps_per_episode):
-                # Always pick the best action - greedy
-                action = self.choose_action(env, state, 0.0)
+                # Force greedy evaluation independent of exploration strategy
+                action = int(np.argmax(self.Q[state]))
                 next_obs, reward, done, truncated, _ = env.step(action)
                 next_state = discretize_state(next_obs, self.position_bins, self.velocity_bins)
 
@@ -283,20 +414,31 @@ class COINQLearningAgent:
         init_Q_random: bool = True,
         instantiate_from_average: bool = False,
         avoid_novel: bool = False,
+        exploration: Union[str, "ExplorationStrategy", None] = "epsilon_greedy",
+        softmax_temperature: float = 1.0,
+        softmax_decay: float = 0.999,
+        softmax_min_temperature: float = 0.05,
+        rng: Optional[np.random.Generator] = None,
     ):
         """
         Initialize the COIN Q-learning agent with hyperparameters and bin settings.
 
         Args:
             env (gym.Env): An initialized Gymnasium environment.
+            max_contexts (int): Number of known (non-novel) contexts.
             num_position_bins (int, optional): Number of bins for discretizing position.
             num_velocity_bins (int, optional): Number of bins for discretizing velocity.
             alpha (float, optional): Learning rate.
             gamma (float, optional): Discount factor.
-            epsilon (float, optional): Initial epsilon for all -greedy strategies.
+            epsilon (float, optional): Initial epsilon for all ε-greedy strategies.
             epsilon_decay (float, optional): Epsilon decay factor after each episode.
             min_epsilon (float, optional): Minimum value of epsilon.
             init_Q_random (bool, optional): When True, initialise Q-table randomly, otherwise to zeros.
+            instantiate_from_average (bool, optional): Initialise new context from weighted average Q.
+            avoid_novel (bool, optional): Ignore novel context for action selection if True.
+            exploration (str|ExplorationStrategy|None): "epsilon_greedy" (default), "softmax", "random", or a custom strategy instance.
+            softmax_*: Parameters for softmax exploration.
+            rng: Optional numpy Generator for reproducibility.
         """
         self.num_position_bins = num_position_bins
         self.num_velocity_bins = num_velocity_bins
@@ -307,6 +449,7 @@ class COINQLearningAgent:
         self.min_epsilon = min_epsilon
         self.instantiate_from_average = instantiate_from_average
         self.avoid_novel = avoid_novel
+        self.rng = rng or np.random.default_rng()
 
         # Extract state boundaries (assuming a 2D state: [position, velocity])
         self.position_min, self.position_max = env.low[0], env.high[0]
@@ -316,41 +459,89 @@ class COINQLearningAgent:
         self.position_bins = np.linspace(self.position_min, self.position_max, self.num_position_bins)
         self.velocity_bins = np.linspace(self.velocity_min, self.velocity_max, self.num_velocity_bins)
 
-        # Initialize Q-table and exploration database
+        # Initialize Q-table database (append one extra for the novel context)
         n_actions = env.action_space.n
         if init_Q_random:
             self.Qdat = [np.random.uniform(
                 low=-2, high=0, size=(self.num_position_bins, self.num_velocity_bins, n_actions)
-            ) for _ in range(max_contexts+1)] # Also set one up for the novel context
+            ) for _ in range(max_contexts + 1)]
         else:
-            self.Qdat = [np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions)) for _ in range(max_contexts+1)]
-        
-        # Track which contexts have been initialised - only novel initialised initially
-        self.context_init = np.zeros((max_contexts+1,))
-        self.context_init[-1] = 1
+            self.Qdat = [np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions))
+                         for _ in range(max_contexts + 1)]
 
-        self.epsdat = [epsilon for _ in range(max_contexts)] # Epsilon for each context (not novel)
-        
+        # Track which contexts have been initialised - only novel initialised initially
+        self.context_init = np.zeros((max_contexts + 1,))
+        self.context_init[-1] = 1  # novel
+
+        # Per-context epsilon (for ε-greedy only; ignored by other strategies)
+        self.epsdat = [epsilon for _ in range(max_contexts)]  # excludes novel; novel uses max_epsilon implicitly if needed
+
+        # Build exploration strategy (global)
+        self.strategy = self._build_strategy(
+            exploration=exploration,
+            epsilon=epsilon,
+            epsilon_decay=epsilon_decay,
+            min_epsilon=min_epsilon,
+            softmax_temperature=softmax_temperature,
+            softmax_decay=softmax_decay,
+            softmax_min_temperature=softmax_min_temperature,
+        )
+
+    @staticmethod
+    def _build_strategy(
+        exploration: Union[str, "ExplorationStrategy", None],
+        *,
+        epsilon: float,
+        epsilon_decay: float,
+        min_epsilon: float,
+        softmax_temperature: float,
+        softmax_decay: float,
+        softmax_min_temperature: float,
+    ) -> "ExplorationStrategy":
+        # Accept a custom strategy instance
+        try:
+            from typing import runtime_checkable, Protocol  # noqa: F401
+            from typing import Any
+            # If ExplorationStrategy is in scope and runtime-checkable:
+            if isinstance(exploration, ExplorationStrategy):  # type: ignore[name-defined]
+                return exploration  # type: ignore[return-value]
+        except Exception:
+            # If typing Protocol check isn't available, fall through to string handling
+            pass
+
+        if exploration is None or exploration == "epsilon_greedy":
+            return EpsilonGreedy(epsilon, epsilon_decay, min_epsilon)
+        if exploration == "softmax":
+            return SoftmaxExploration(
+                temperature=softmax_temperature,
+                decay=softmax_decay,
+                min_temperature=softmax_min_temperature,
+            )
+        if exploration == "random":
+            return RandomExploration()
+
+        raise ValueError(f"Unknown exploration type: {exploration!r}")
+
+    # -------- Policy & Learning --------
 
     def choose_action(self, env: gym.Env, Q: np.ndarray, state: Tuple[int, int], eps: float) -> int:
         """
-        Choose an action using an -greedy policy.
-
-        Args:
-            state (Tuple[int, int]): Discretized state indices.
-            eps (float): Epsilon value for exploration.
-
-        Returns:
-            int: Action chosen by the policy.
+        Choose an action using the configured exploration strategy.
+        For ε-greedy, 'eps' overrides the strategy's epsilon to support per-context averaging.
+        For other strategies, 'eps' is ignored.
         """
-        rand = np.random.random()
-        if rand < eps:
-            return env.action_space.sample()
-        return np.argmax(Q[state])
+        q_row = Q[state]
+        epsilon_override = eps if isinstance(self.strategy, EpsilonGreedy) else None
+        return self.strategy.select_action(
+            q_row,
+            env.action_space,
+            epsilon_override=epsilon_override,
+            rng=self.rng,
+        )
 
     def update_q_table(
         self,
-        Qavg,
+        Qavg: np.ndarray,
         state: Tuple[int, int],
         action: int,
         reward: float,
@@ -359,30 +550,20 @@ class COINQLearningAgent:
     ) -> None:
         """
         Update the Q-tables using the COIN Q-learning update rule.
-
-        Args:
-            state (Tuple[int, int]): Current discretized state indices.
-            action (int): Action taken.
-            reward (float): Reward received from the environment.
-            next_state (Tuple[int, int]): Next discretized state indices.
-            p_context (np.ndarray): Probability of each context in the model.
         """
         best_next_action = np.argmax(Qavg[next_state])
+        Z = np.nansum(p_context ** 2)  # normalizing constant for learning rates
         for i in range(len(self.Qdat)):
             if self.context_init[i] and not np.isnan(p_context[i]):
-                td_target = reward + self.gamma * self.Qdat[i][next_state][best_next_action]
-                td_error = td_target - self.Qdat[i][state][action]
-                if i==len(self.Qdat)-1:
-                    # Fully update the novel context at any step
-                    p = 1
-                else:
-                    p = p_context[i]
-                self.Qdat[i][state][action] += p * self.alpha * td_error
+                td_target = reward + self.gamma * Qavg[next_state][best_next_action]
+                td_error = td_target - Qavg[state][action]
+                p = float(p_context[i])
+                self.Qdat[i][state][action] += p * self.alpha * td_error / max(Z, 1e-8)
 
     def instantiate_context_Q(
-            self,
-            new_context,
-            probs: np.ndarray = None,
+        self,
+        new_context: int,
+        probs: np.ndarray = None,
     ):
         """When a novel context is instantiated, copy current Q novel table (or average) to that new context value."""
         if self.instantiate_from_average and probs is not None:
@@ -394,72 +575,71 @@ class COINQLearningAgent:
         else:
             # Copy the last Q-table (novel) to the new context
             self.Qdat[new_context] = self.Qdat[-1].copy()
-        self.epsdat[new_context] = self.max_epsilon # Set epsilon to max for new context
-        
+        # Reset epsilon high for the new context (ε-greedy only)
+        if new_context < len(self.epsdat):
+            self.epsdat[new_context] = self.max_epsilon
+
     def train_step(
         self,
-        env : gym.Env,
+        env: gym.Env,
         p_context: np.ndarray,
-        max_steps_per_episode: int = 200
+        max_steps_per_episode: int = 200,
+        average_bias: np.ndarray = None, # bias to be added for average
     ) -> float:
         """
-        Train the COIN Q-learning agent in its environment using an -greedy policy through one episode.
-
-        Args:
-            env (gym.Env): An initialized Gymnasium environment.
-            p_context (np.ndarray): Probability of each context in the model.
-            max_steps_per_episode (int, optional): Maximum steps to run in each episode.
-
-        Returns:
-            float: 
-                - The total episode reward.
+        Train the COIN Q-learning agent for one episode using the configured exploration.
         """
-
         obs, _ = env.reset()
         state = discretize_state(obs, self.position_bins, self.velocity_bins)
         episode_reward = 0.0
 
-        # Check if new context initialised
+        # p_context may not be the same size as max_contexts+1
+        # rearrange it to extend it, moving novel to the end
+        if p_context.shape[0] < len(self.context_init):
+            B = np.array([np.nan] * (len(self.context_init) - p_context.shape[0]))
+            B = np.expand_dims(B, axis=-1)
+            p_context = np.vstack([p_context[:-1], B, p_context[-1:]])
+
+        # Instantiate any new contexts that became active
         for i, init in enumerate(self.context_init):
             if init == 0 and not np.isnan(p_context[i]):
-                # Remove novel from initialisation - only relevant if self.instantiate_from_average is True
                 instant_probs = p_context.copy()
-                # Remove current context
+                # Remove current context from averaging weights
                 instant_probs[i] = 0.0
                 if np.nansum(instant_probs[:-1]) > 0:
-                    instant_probs[:-1] = instant_probs[:-1]/np.nansum(instant_probs[:-1])
+                    instant_probs[:-1] = instant_probs[:-1] / np.nansum(instant_probs[:-1])
                     instant_probs[-1] = 0.0
                 else:
-                    instant_probs[-1] = 1.0 # Ensure novel is 1.0
-                # Context initialised
+                    instant_probs[-1] = 1.0  # ensure novel is 1.0
                 self.instantiate_context_Q(i, probs=instant_probs)
-                # Update tracking
                 self.context_init[i] = 1
 
         for _ in range(max_steps_per_episode):
-            # If "self.avoid_novel" is True, attempt to ignore novel context
+            # If "avoid_novel" is True, attempt to ignore novel context for action selection
             action_probs = p_context.copy()
             if self.avoid_novel and np.nansum(action_probs[:-1]) > 0:
-                # Find probabilities scaled without novel for action selection - avoids instabilities
-                action_probs[:-1] = action_probs[:-1]/np.nansum(action_probs[:-1])
+                action_probs[:-1] = action_probs[:-1] / np.nansum(action_probs[:-1])
                 action_probs[-1] = 0.0
-            # Find average Q and eps
-            Qavg = np.zeros_like(self.Qdat[0])
+
+            # Compute averaged Q and averaged epsilon (for ε-greedy only)
+            if average_bias is None:
+                Qavg = np.zeros_like(self.Qdat[0])
+            else:
+                Qavg = average_bias.copy()
             epsavg = 0.0
             for i in range(len(self.Qdat)):
-                ctx_exp = self.epsdat[i] if i < len(self.epsdat) else self.max_epsilon # Novel context has eps=0.3
                 if self.context_init[i] and not np.isnan(action_probs[i]):
                     Qavg += action_probs[i] * self.Qdat[i]
-                    epsavg += action_probs[i] * ctx_exp
+                    # context epsilon (ε-greedy only); for novel (index == last), use max_epsilon
+                    ctx_eps = self.epsdat[i] if i < len(self.epsdat) else self.max_epsilon
+                    epsavg += action_probs[i] * ctx_eps
 
-            # Choose action
+            # Choose action via the pluggable strategy
             action = self.choose_action(env, Qavg, state, epsavg)
 
-            # Step in the environment
+            # Step and update
             next_obs, reward, done, truncated, _ = env.step(action)
             next_state = discretize_state(next_obs, self.position_bins, self.velocity_bins)
-
-            # Update Q-table
             self.update_q_table(Qavg, state, action, reward, next_state, p_context)
 
             state = next_state
@@ -468,12 +648,19 @@ class COINQLearningAgent:
             if done or truncated:
                 break
 
-        # Epsilon decay - for every context
-        for i in range(len(self.epsdat)):
-            if self.context_init[i] and not np.isnan(p_context[i]):
-                self.epsdat[i] = max(self.min_epsilon, self.epsdat[i] * self.epsilon_decay**(p_context[i]))
+        # Decay schedules:
+        # - For ε-greedy we keep your per-context decay rule.
+        # - For other strategies, we call their episode hook (e.g., softmax temperature decay).
+        if isinstance(self.strategy, EpsilonGreedy):
+            for i in range(len(self.epsdat)):
+                if self.context_init[i] and not np.isnan(p_context[i]):
+                    self.epsdat[i] = max(
+                        self.min_epsilon,
+                        self.epsdat[i] * (self.epsilon_decay ** (p_context[i]))
+                    )
+        else:
+            self.strategy.on_episode_end()
 
-        # End of training
         env.close()
         return episode_reward
 
@@ -484,25 +671,16 @@ class COINQLearningAgent:
         n_episodes: int = 10,
         max_steps_per_episode: int = 500,
         ignore_novel: bool = False,
+        average_bias: np.ndarray = None, # bias to be added for average
     ) -> List[float]:
         """
-        Execute the learned policy (greedy w.r.t. the Q-table) to evaluate performance.
-        This method does not update the Q-tables.
-
-        Args:
-            env (gym.Env): An initialized Gymnasium environment.
-            p_context (np.ndarray): Probability of each context in the model.
-            n_episodes (int, optional): Number of episodes to repeat for evaluation - display.
-            max_steps_per_episode (int, optional): Maximum steps to run in each episode.
-            ignore_novel (bool, optional): Ignore novel context in evaluation and used trained Q-tables.
-
-        Returns:
-            List[float]: Total rewards for each of the evaluation episodes.
+        Execute the learned policy (greedy w.r.t. the averaged Q-table) to evaluate performance.
         """
-        rewards = []
+        rewards: List[float] = []
 
         if ignore_novel and np.nansum(p_context[:-1]) > 0:
-            p_context[:-1] = p_context[:-1]/(np.nansum(p_context[:-1]) + 1e-4)
+            p_context = p_context.copy()
+            p_context[:-1] = p_context[:-1] / (np.nansum(p_context[:-1]) + 1e-4)
             p_context[-1] = 0.0
 
         for _ in range(n_episodes):
@@ -511,14 +689,17 @@ class COINQLearningAgent:
             episode_reward = 0.0
 
             for _ in range(max_steps_per_episode):
-                # Find average Q and eps
-                Qavg = np.zeros_like(self.Qdat[0])
+                # Build averaged Q over contexts
+                if average_bias is None:
+                    Qavg = np.zeros_like(self.Qdat[0])
+                else:
+                    Qavg = average_bias.copy()
                 for i in range(len(self.Qdat)):
                     if self.context_init[i] and not np.isnan(p_context[i]):
                         Qavg += p_context[i] * self.Qdat[i]
 
-                # Always pick the best action - greedy
-                action = self.choose_action(env, Qavg, state, 0.0)
+                # Greedy evaluation independent of exploration strategy
+                action = int(np.argmax(Qavg[state]))
                 next_obs, reward, done, truncated, _ = env.step(action)
                 next_state = discretize_state(next_obs, self.position_bins, self.velocity_bins)
 
@@ -532,7 +713,129 @@ class COINQLearningAgent:
 
         env.close()
         return rewards
+    
+class EmbodiedCOINQLearningAgent(COINQLearningAgent):
+    """
+    An Embodied Contextual Q-Learning agent that splits Q into a body and a contextual head.
+    The body has no contextual information, and aims to learn the average Q given the stationary contextual distribution.
+    The head learns the variations about this average in the same way as COINQLearningAgent.
+    """
+    def __init__(
+        self,
+        env: gym.Env,
+        max_contexts: int,
+        num_position_bins: int = 30,
+        num_velocity_bins: int = 30,
+        alpha: float = 0.1,
+        alpha_body: float = 0.01,
+        gamma: float = 0.99,
+        epsilon: float = 1.0,
+        epsilon_decay: float = 0.999,
+        min_epsilon: float = 0.0,
+        init_Q_random: bool = True,
+        instantiate_from_average: bool = False,
+        avoid_novel: bool = False,
+        exploration: Union[str, "ExplorationStrategy", None] = "epsilon_greedy",
+        softmax_temperature: float = 1.0,
+        softmax_decay: float = 0.999,
+        softmax_min_temperature: float = 0.05,
+        rng: Optional[np.random.Generator] = None,
+    ):
+        """
+        Initialize the Embodied COIN Q-learning agent with hyperparameters and bin settings.
 
+        Args:
+            env (gym.Env): An initialized Gymnasium environment.
+            max_contexts (int): Number of known (non-novel) contexts.
+            num_position_bins (int, optional): Number of bins for discretizing position.
+            num_velocity_bins (int, optional): Number of bins for discretizing velocity.
+            alpha (float, optional): Learning rate.
+            alpha_body (float, optional): Body learning rate.
+            gamma (float, optional): Discount factor.
+            epsilon (float, optional): Initial epsilon for all ε-greedy strategies.
+            epsilon_decay (float, optional): Epsilon decay factor after each episode.
+            min_epsilon (float, optional): Minimum value of epsilon.
+            init_Q_random (bool, optional): When True, initialise Q-table randomly, otherwise to zeros.
+            instantiate_from_average (bool, optional): Initialise new context from weighted average Q.
+            avoid_novel (bool, optional): Ignore novel context for action selection if True.
+            exploration (str|ExplorationStrategy|None): "epsilon_greedy" (default), "softmax", "random", or a custom strategy instance.
+            softmax_*: Parameters for softmax exploration.
+            rng: Optional numpy Generator for reproducibility.
+        """
+        super().__init__(
+            env,
+            max_contexts,
+            num_position_bins,
+            num_velocity_bins,
+            alpha,
+            gamma,
+            epsilon,
+            epsilon_decay,
+            min_epsilon,
+            init_Q_random,
+            instantiate_from_average,
+            avoid_novel,
+            exploration,
+            softmax_temperature,
+            softmax_decay,
+            softmax_min_temperature,
+            rng
+        )
+        self.alpha_body = alpha_body
+
+        # Initialize body Q-table
+        n_actions = env.action_space.n
+        if init_Q_random:
+            self.Qbody = np.random.uniform(
+                low=-2, high=0, size=(self.num_position_bins, self.num_velocity_bins, n_actions)
+            )
+        else:
+            self.Qbody = np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions))
+
+    def update_q_table(
+        self,
+        Qavg: np.ndarray,
+        state: Tuple[int, int],
+        action: int,
+        reward: float,
+        next_state: Tuple[int, int],
+        p_context: np.ndarray
+    ) -> None:
+        """
+        Update the Q-tables using the Embodied COIN Q-learning update rules.
+        """
+        best_next_action_body = np.argmax(self.Qbody[next_state])
+
+        # Update body table
+        td_target_body = reward + self.gamma * self.Qbody[next_state][best_next_action_body]
+        td_error_body = td_target_body - self.Qbody[state][action]
+        self.Qbody[state][action] += self.alpha_body * td_error_body
+
+        # Head updates
+        super().update_q_table(Qavg, state, action, reward, next_state, p_context)
+
+        # Body inhibition on head values
+        for i in range(len(self.Qdat)):
+            if self.context_init[i] and not np.isnan(p_context[i]):
+                self.Qdat[i][state][action] -= self.alpha_body * td_error_body
+
+    def train_step(
+        self,
+        env: gym.Env,
+        p_context: np.ndarray,
+        max_steps_per_episode: int = 200
+    ) -> float:
+        return super().train_step(env, p_context, max_steps_per_episode, average_bias=self.Qbody)
+    
+    def evaluate(
+        self,
+        env: gym.Env,
+        p_context: np.ndarray,
+        n_episodes: int = 10,
+        max_steps_per_episode: int = 500,
+        ignore_novel: bool = False
+    ) -> List[float]:
+        return super().evaluate(env, p_context, n_episodes, max_steps_per_episode, ignore_novel, average_bias=self.Qbody)
 
 
 class _MLP(nn.Module):

@@ -510,7 +510,7 @@ def _make_perturbations(kind: str):
 
 @pytest.mark.parametrize(
     "perturb_kind",
-    ["single", "medium", pytest.param("complex", marks=pytest.mark.slow)],
+    ["single", "medium", "complex"],
 )
 def test_rt_matches_batch_simulation_given_same_feedback(perturb_kind):
     """
@@ -805,3 +805,35 @@ def test_update_stats_for_parameters_dispatch_parity(fresh_models, monkeypatch):
 
     assert calls_p == dict(gtp=1, gcp=1, dyn=1, bias=1)
     assert calls_c == dict(gtp=1, gcp=1, dyn=1, bias=1)
+
+def test_get_prob_parity():
+    """Parity of get_responsibilities, get_predicted_probabilities and get_predicted_responsibilities calls."""
+    coin, coin_rt = import_modules()
+    
+    np.random.seed(42)
+    parent = coin.COIN(particles=7, max_contexts=5)
+
+    parent.perturbations = np.concatenate([np.zeros(5), np.ones(5), -np.ones(3), np.ones(5) * np.nan]).astype(float)
+
+    out_p = parent.simulate_coin()
+    sf = out_p["runs"][0]["state_feedback"]
+
+    child = coin_rt.COIN_RT(particles=7, max_contexts=5)
+    
+    # Set identical state from output values
+    child.perturbations = parent.perturbations.copy()
+    child.coin_state["stored"] = _dcopy(out_p["runs"][0])
+
+    resp_p = parent.get_responsibilities(out_p)
+    resp_c = child.get_responsibilities()
+    for i, r in enumerate(resp_p):
+        np.testing.assert_allclose(resp_c[i], r)
+
+    predp_p = parent.get_predicted_probabilities(out_p)
+    predp_c = child.get_predicted_probabilities()
+    np.testing.assert_allclose(predp_c, predp_p)
+
+    y_vals = np.linspace(-1, 1, num=5)
+    predr_p = parent.get_predicted_responsibilities(out_p, y_vals)
+    predr_c = child.get_predicted_responsibilities(y_vals)
+    np.testing.assert_allclose(predr_c, predr_p)
