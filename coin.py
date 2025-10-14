@@ -1215,16 +1215,28 @@ class COIN:
         
         self.generate_figures(P)
 
-    def find_optimal_context_labels(self, S: Dict[str, Any]): # CHECKED FOR MATLAB CONSISTENCY
+    def find_optimal_context_labels(self, S: Dict[str, Any]):
+        """Find the optimal context labels for plotting by minimising the Hamming distance between context sequences across particles."""
+        # "Resample_inds" currently has shape [R,P,T]. The above changes this to [R*P,T]
         inds_resampled = self.resample_inds(S)
+
+        # A dict form {trial: array of shape [P,trial]} where we follow the context sequence for each particle up to the given trial
         context_sequence = self.context_sequence(S, inds_resampled)
+
+        # Obtain the number of instantiated contexts for each particle as they vary per trial
+        # - C: array of shape [R*P,T] with the number of instantiated contexts for each particle at each trial
+        # - mode_number_of_contexts: array of shape [T] with modal number of instantiated contexts across particles at each trial
         C, _, _, mode_number_of_contexts = self.posterior_number_of_contexts(context_sequence, S)
         
         P = {}
         P["mode_number_of_contexts"] = mode_number_of_contexts
         
         # context label permutations
+
+        # All possible permutations of context labels up to the maximum number of contexts
         L = np.array(list(permutations(np.arange(0,np.max(mode_number_of_contexts).astype(int)))))
+
+        # Rearrange shape so that L has shape [max_mode_number_of_contexts, 1, num_permutations], also obtain number of permutations
         L = np.transpose(L[None], (2, 0, 1))
         n_perms = factorial(np.max(mode_number_of_contexts).astype(int))
         
@@ -1266,7 +1278,7 @@ class COIN:
                 inds, _ = np.where(f[i-1][:, None] == inds_resampled[f[i][to_unique[i]], i][None])
                 parent = from_unique[i-1][inds]
                 
-                # pass Hamming distances from parents to children - TODO: Check this against MATLAB - Currently not getting any 0 distance points
+                # pass Hamming distances from parents to children
                 inds_1 = np.tile(parent[:, None, None], [1, n_sequences, n_perms])
                 inds_2 = np.tile(parent[None, :, None], [n_sequences, 1, n_perms])
                 inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
@@ -1333,8 +1345,10 @@ class COIN:
         return inds_resampled
     
     def context_sequence(self, S: Dict[str, Any], inds_resampled: np.ndarray):
+        """Reconstruct the context sequence for each particle in each run, after resampling."""
         num_trials = len(self.perturbations)
         
+        # Dictionary of form {trial: context_sequence} for context_sequence shape (particles*runs, trial)
         context_seq = {}
         
         for n in range(self.runs):
@@ -1343,8 +1357,11 @@ class COIN:
                 if n == 0:
                     context_seq[i] = np.zeros((self.particles * self.runs, i+1), dtype=int)
                 if i > 0:
+                    # Set the context sequence up to trial i-1 to be the same as that of previous trial sequence
                     context_seq[i][p, :i] = context_seq[i-1][p, :]
+                    # Appropriately resample all context values according to inds_resampled
                     context_seq[i][p, :] = context_seq[i][inds_resampled[p, i], :]
+                # Set the context at trial i to be the context sampled at trial i
                 context_seq[i][p, i] = S["runs"][n]["context"][:, i]
                 
         return context_seq
@@ -1352,7 +1369,7 @@ class COIN:
     def posterior_number_of_contexts(self, context_sequence: Dict[int, Any], S: Dict[str, Any]):
         num_trials = len(self.perturbations)
         
-        # number of contexts
+        # number of contexts per particle up to the current trial
         C = np.zeros((self.particles * self.runs, num_trials), dtype=int)
 
         for n in range(self.runs):

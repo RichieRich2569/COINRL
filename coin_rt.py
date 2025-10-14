@@ -92,6 +92,9 @@ import numpy as np
 
 import coin
 
+from math import factorial
+from itertools import permutations
+
 from utils.general_utils import (
     sample_num_tables_CRF, 
     per_slice_invert, 
@@ -222,8 +225,21 @@ class COIN_RT(coin.COIN):
             self.coin_state = self.initialise_coin(cues_exist=cues_exist)
 
             # Perturbations
-            self.perturbations = np.array([]) # This array is not used in COIN-RT, but its size is 
-            # incremented every step to keep compatibility.
+            self.perturbations = np.array([]) # This array is not used in COIN-RT, but its size is incremented for compatibility with parent.
+
+            # For context tracking and probabilities
+            # Context sequence
+            self.context_seq = {} # Dictionary of form {trial: context_sequence} for context_sequence shape (particles, trial)
+            # Maximum number of instantiated contexts across particles
+            self.C = np.zeros((self.particles, 1), dtype=int) # shape (particles, 1)
+            # Mode number of instantiated contexts per trial
+            self.mode_number_of_contexts = np.zeros((1, ), dtype=int) # shape (1, ) for initialization
+            # Posterior over number of contexts
+            self.posterior = np.zeros((self.max_contexts+1, 1))
+            self.posterior_mean = np.zeros((1, ))
+            self.posterior_mode = np.zeros((1, ), dtype=int)
+
+
 
         def initialise_coin(self, cues_exist: bool):
             """Initialise the COIN model state."""
@@ -350,7 +366,177 @@ class COIN_RT(coin.COIN):
             S["properties"] = self
             return S
         
+        def find_optimal_context_labels(self, S: Dict[str, Any]):
+            """
+               Find the optimal context labels for plotting by minimising the Hamming distance between context sequences across particles.
+               Real-time option, which updates the optimal context labels once per trial.
+            """
+            # Obtain inds_resampled, only 1 run in RT version.
+            inds_resampled = S["runs"][0]["resample_inds"]
+
+            # A dict form {trial: array of shape [P,trial]} where we follow the context sequence for each particle up to the given trial
+            context_sequence = self.context_sequence(S, inds_resampled)
+
+            # Obtain the number of instantiated contexts for each particle as they vary per trial
+            # - C: array of shape [R*P,T] with the number of instantiated contexts for each particle at each trial
+            # - mode_number_of_contexts: array of shape [T] with modal number of instantiated contexts across particles at each trial
+            C, _, _, mode_number_of_contexts = self.posterior_number_of_contexts(context_sequence, S)
+            
+            P = {}
+            P["mode_number_of_contexts"] = mode_number_of_contexts
+            
+            # context label permutations
+
+            # All possible permutations of context labels up to the maximum number of contexts
+            L = np.array(list(permutations(np.arange(0,np.max(mode_number_of_contexts).astype(int)))))
+
+            # Rearrange shape so that L has shape [max_mode_number_of_contexts, 1, num_permutations], also obtain number of permutations
+            L = np.transpose(L[None], (2, 0, 1))
+            n_perms = factorial(np.max(mode_number_of_contexts).astype(int))
+            
+            num_trials = len(self.perturbations)
+            
+            f = {}
+            to_unique = {}
+            from_unique = {}
+            optimal_assignment = {}
+            
+            for i in range(num_trials):
+                if np.mod(i+1, 50) == 0:
+                    print(f"Finding optimal context labels (trial = {i+1})")
+                
+                # exclude sequences for which C > max(mode_number_of_context) as these sequences
+                # (and their descendents) will never be analysed
+                f[i] = np.where(C[:, i] <= np.max(mode_number_of_contexts))[0]
+                
+                # identify unique sequences (to avoid performing the same computations multiple times)
+                unique_seqs, inds, reverse_inds = np.unique(
+                    context_sequence[i][f[i]], axis=0, return_index=True, return_inverse=True
+                )
+                to_unique[i] = inds
+                from_unique[i] = reverse_inds
+                
+                n_sequences = len(unique_seqs)
+                
+                # identify particles that have the same number of contexts as the most common number of
+                # contexts (only contexts (only these particles will be analysed)
+                valid_particle_inds = (C[f[i], i] == mode_number_of_contexts[i])
+                
+                if i == 0:
+                    # hamming distances on trial 0
+                    # dimension 2 of H considers all possible label permutations
+                    H = (L[[0], :, :] != 0) * 1.0 # (1, 1, num_permutations)
+                else:
+                    # identify a valid parent of each unique sequence
+                    # i.e., a sequence on the previous trial that is identical up to the previous trial
+                    inds, _ = np.where(f[i-1][:, None] == inds_resampled[f[i][to_unique[i]], i][None])
+                    parent = from_unique[i-1][inds]
+                    
+                    # pass Hamming distances from parents to children
+                    inds_1 = np.tile(parent[:, None, None], [1, n_sequences, n_perms])
+                    inds_2 = np.tile(parent[None, :, None], [n_sequences, 1, n_perms])
+                    inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
+                    
+                    H_new = np.zeros((n_sequences, n_sequences, n_perms))
+                    
+                    for ii in range(n_sequences):
+                        for jj in range(n_sequences):
+                            for kk in range(n_perms):
+                                H_new[ii, jj, kk] = H[inds_1[ii, jj, kk], inds_2[ii, jj, kk], inds_3[ii, jj, kk]]
+                    
+                    # recursively update Hamming distances
+                    # dimension 2 of H considers all possible label permutations
+                    for seq in range(n_sequences):
+                        H_new[seq:, [seq], :] = H_new[seq:, [seq], :] + ((unique_seqs[seq, -1]-1) != L[unique_seqs[seq:, -1]-1, :, :]) * 1.0
+                        H_new[seq, seq:, :] = H_new[seq:, seq, :] # by symmetry of Hamming distance
+                    
+                    H = H_new
+                
+                # compute the Hamming distance between each pair of sequences (after optimally permuting labels)
+                H_optimal = np.min(H, axis=2)
+                
+                # count the number of times each unique sequence occurs
+                sequence_count = np.sum(
+                    from_unique[i][valid_particle_inds][:, None] == np.arange(len(unique_seqs))[None], 
+                    axis=0, 
+                )
+                
+                # compute the mean optimal Hamming distance of each sequence to all other sequences.
+                # the distance from sequence i to sequence j is weighted by the number of times sequence j occurs.
+                # if i == j, this weight is reduced by 1 so that the distance from one instance of sequence i to itself is ignored.
+                H_mean = np.mean(H_optimal * (sequence_count[None] - np.eye(n_sequences)), axis=1)
+                
+                # assign infinite distance to invalid sequences 
+                # i.e., sequences for which the number of contexts is not equal to the most common number of contexts
+                H_mean[sequence_count == 0] = np.inf
+                
+                # find the index of the typical sequence 
+                # (the sequence with minimum mean optimal Hamming distance to all other sequences)
+                min_ind = np.argmin(H_mean, axis=0)
+                
+                # typical context sequence
+                typical_sequence = unique_seqs[min_ind, :]
+                
+                # store the optimal permutation of labels for each sequence with respect to the typical sequence
+                j = np.argmin(H[min_ind, :, :], axis=-1)
+                optimal_assignment[i] = np.transpose(
+                    L[:int(mode_number_of_contexts[i]), :, j].reshape((int(mode_number_of_contexts[i]), -1, 1)), 
+                    [2, 0, 1], 
+                )
         
+            return P, S, optimal_assignment, from_unique, context_sequence, C
+        
+        def context_sequence(self, S: Dict[str, Any], inds_resampled: np.ndarray):
+            """Reconstruct the context sequence for each particle in each run, after resampling. Rebuild for RT version."""
+            
+            # Update our context sequence dictionary
+            i = self.trial
+            self.context_seq[i] = np.zeros((self.particles, i+1), dtype=int)
+            if i > 0:
+                # Set the context sequence up to trial i-1 to be the same as that of previous trial sequence
+                self.context_seq[i][:, :i] = self.context_seq[i-1][:, :]
+                # Appropriately resample all context values according to inds_resampled
+                self.context_seq[i][:, :] = self.context_seq[i][inds_resampled[:, i], :]
+            # Set the context at trial i to be the context sampled at trial i
+            self.context_seq[i][:, i] = S["runs"][0]["context"][:, i]
+
+            return self.context_seq
+        
+        def posterior_number_of_contexts(self, context_sequence: Dict[int, Any], S: Dict[str, Any]): 
+            """Compute the posterior over the number of contexts instantiated by the model at each trial, given the context sequences."""           
+            # extend context tracking variables if number of trials greater than current size of C
+            trial = self.trial
+
+            # Ensure shape of all context tracking variables is identical in trial dimension
+            if not (np.shape(self.C)[1] == np.shape(self.mode_number_of_contexts)[0] 
+                    == np.shape(self.posterior_mean)[0] 
+                    == np.shape(self.posterior_mode)[0] 
+                    == np.shape(self.posterior)[1]):
+                raise ValueError("Context tracking variables have inconsistent trial dimensions.")
+            
+            existing_trials = np.shape(self.C)[1]
+            if existing_trials <  trial:
+                self.C = np.hstack((self.C, np.zeros((self.particles * self.runs, trial - existing_trials), dtype=int)))
+                self.mode_number_of_contexts = np.hstack((self.mode_number_of_contexts, np.zeros((trial - existing_trials, ), dtype=int)))
+                self.posterior = np.hstack((self.posterior, np.zeros((self.max_contexts+1, trial - existing_trials))))
+                self.posterior_mean = np.hstack((self.posterior_mean, np.zeros((trial - existing_trials, ))))
+                self.posterior_mode = np.hstack((self.posterior_mode, np.zeros((trial - existing_trials, ), dtype=int)))
+
+            for i in range(existing_trials, trial):
+                self.C[:, i] = np.max(context_sequence[i], axis=1)
+
+            particle_weight = np.repeat(S["weights"], self.particles) / self.particles
+            
+            
+            for i in range(existing_trials, trial):
+                for context in range(np.max(self.C[:, i])):
+                    self.posterior[context, i] = np.sum((self.C[:, i] == (context+1)) * particle_weight)
+
+                self.posterior_mean[i] = np.sum(np.arange(1,self.max_contexts+2) * self.posterior[:, i])
+                self.posterior_mode[i] = np.argmax(self.posterior[:, i])+1 # contexts seen as 1 and not 0
+
+            return self.C, self.posterior, self.posterior_mean, self.posterior_mode
+
         def predict_context(self, coin_state: Dict[str, Any], cue: Optional[int] = None) -> Dict[str, Any]:
             # Check if cues are provided when cues_exist is True
             if coin_state["cues_exist"] and cue is None:
