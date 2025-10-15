@@ -170,10 +170,6 @@ class COIN_RT(coin.COIN):
             alpha_cue: float = 25, 
             infer_bias: bool = False, 
             prior_precision_bias: float = 70 ** 2, 
-            # runs
-            runs: int = 1, 
-            # parallel processing
-            max_cores: int = 1, 
             # model implementation
             particles: int = 100, 
             max_contexts: int = 10,
@@ -201,10 +197,10 @@ class COIN_RT(coin.COIN):
                 alpha_cue=alpha_cue, 
                 infer_bias=infer_bias, 
                 prior_precision_bias=prior_precision_bias, 
-                # runs
-                runs=runs, 
-                # parallel processing
-                max_cores=max_cores, 
+                # runs - only one run for RT version
+                runs=1, 
+                # parallel processing - disabled
+                max_cores=0, 
                 # model implementation
                 particles=particles, 
                 max_contexts=max_contexts, 
@@ -232,8 +228,6 @@ class COIN_RT(coin.COIN):
             self.context_seq = {} # Dictionary of form {trial: context_sequence} for context_sequence shape (particles, trial)
             # Maximum number of instantiated contexts across particles
             self.C = np.zeros((self.particles, 1), dtype=int) # shape (particles, 1)
-            # Mode number of instantiated contexts per trial
-            self.mode_number_of_contexts = np.zeros((1, ), dtype=int) # shape (1, ) for initialization
             # Posterior over number of contexts
             self.posterior = np.zeros((self.max_contexts+1, 1))
             self.posterior_mean = np.zeros((1, ))
@@ -281,7 +275,7 @@ class COIN_RT(coin.COIN):
             # Increment trial and num_trials as well as size of perturbations
             self.coin_state["trial"] += 1
             self.coin_state["num_trials"] += 1
-            trial = self.coin_state["trial"]
+            self.trial = self.coin_state["trial"]
             # Ensure perturbations is a 1-D numpy array and extend its length by 1
             p = np.asarray(self.perturbations)
             if p.ndim > 1:
@@ -305,11 +299,11 @@ class COIN_RT(coin.COIN):
                     raise ValueError(f"Cue must be between 1 and {self.max_cues} (inclusive).")
                 if cue > max_cue + 1:
                     raise ValueError(f"Can only introduce one new cue, in ascending order, at a time. Current max cue is {max_cue}.")
-                self.cues.insert(trial-1, cue)
+                self.cues.insert(self.trial-1, cue)
             
             # Feedback observed or not
-            temp = np.ones((trial, ))
-            temp[:trial-1] = self.coin_state["feedback_observed"]
+            temp = np.ones((self.trial, ))
+            temp[:self.trial-1] = self.coin_state["feedback_observed"]
             if np.isnan(state_feedback):
                 temp[-1] = 0
             self.coin_state["feedback_observed"] = temp
@@ -362,25 +356,21 @@ class COIN_RT(coin.COIN):
             S = {}
             S["runs"] = {}
             S["runs"][0] = self.coin_state["stored"]
-            S["weights"] = np.ones((self.runs, )) / self.runs
             S["properties"] = self
             return S
         
-        def find_optimal_context_labels(self, S: Dict[str, Any]):
+        def find_optimal_context_labels(self):
             """
                Find the optimal context labels for plotting by minimising the Hamming distance between context sequences across particles.
                Real-time option, which updates the optimal context labels once per trial.
             """
-            # Obtain inds_resampled, only 1 run in RT version.
-            inds_resampled = S["runs"][0]["resample_inds"]
-
             # A dict form {trial: array of shape [P,trial]} where we follow the context sequence for each particle up to the given trial
-            context_sequence = self.context_sequence(S, inds_resampled)
+            context_sequence = self.context_sequence() # Generate new value for current trial
 
             # Obtain the number of instantiated contexts for each particle as they vary per trial
             # - C: array of shape [R*P,T] with the number of instantiated contexts for each particle at each trial
             # - mode_number_of_contexts: array of shape [T] with modal number of instantiated contexts across particles at each trial
-            C, _, _, mode_number_of_contexts = self.posterior_number_of_contexts(context_sequence, S)
+            C, _, _, mode_number_of_contexts = self.posterior_number_of_contexts(context_sequence)
             
             P = {}
             P["mode_number_of_contexts"] = mode_number_of_contexts
@@ -394,17 +384,13 @@ class COIN_RT(coin.COIN):
             L = np.transpose(L[None], (2, 0, 1))
             n_perms = factorial(np.max(mode_number_of_contexts).astype(int))
             
-            num_trials = len(self.perturbations)
-            
             f = {}
             to_unique = {}
             from_unique = {}
             optimal_assignment = {}
             
-            for i in range(num_trials):
-                if np.mod(i+1, 50) == 0:
-                    print(f"Finding optimal context labels (trial = {i+1})")
-                
+            # Loop through all trials up to the current time point - run time increases with number of trials
+            for i in range(self.trial):        
                 # exclude sequences for which C > max(mode_number_of_context) as these sequences
                 # (and their descendents) will never be analysed
                 f[i] = np.where(C[:, i] <= np.max(mode_number_of_contexts))[0]
@@ -429,7 +415,7 @@ class COIN_RT(coin.COIN):
                 else:
                     # identify a valid parent of each unique sequence
                     # i.e., a sequence on the previous trial that is identical up to the previous trial
-                    inds, _ = np.where(f[i-1][:, None] == inds_resampled[f[i][to_unique[i]], i][None])
+                    inds, _ = np.where(f[i-1][:, None] == self.inds_resampled[f[i][to_unique[i]], i][None])
                     parent = from_unique[i-1][inds]
                     
                     # pass Hamming distances from parents to children
@@ -484,9 +470,9 @@ class COIN_RT(coin.COIN):
                     [2, 0, 1], 
                 )
         
-            return P, S, optimal_assignment, from_unique, context_sequence, C
+            return P, optimal_assignment, from_unique, context_sequence, C
         
-        def context_sequence(self, S: Dict[str, Any], inds_resampled: np.ndarray):
+        def context_sequence(self):
             """Reconstruct the context sequence for each particle in each run, after resampling. Rebuild for RT version."""
             
             # Update our context sequence dictionary
@@ -496,39 +482,38 @@ class COIN_RT(coin.COIN):
                 # Set the context sequence up to trial i-1 to be the same as that of previous trial sequence
                 self.context_seq[i][:, :i] = self.context_seq[i-1][:, :]
                 # Appropriately resample all context values according to inds_resampled
-                self.context_seq[i][:, :] = self.context_seq[i][inds_resampled[:, i], :]
+                self.context_seq[i][:, :] = self.context_seq[i][self.coin_state["inds_resampled"], :]
             # Set the context at trial i to be the context sampled at trial i
-            self.context_seq[i][:, i] = S["runs"][0]["context"][:, i]
+            self.context_seq[i][:, i] = self.coin_state["context"]
 
             return self.context_seq
         
-        def posterior_number_of_contexts(self, context_sequence: Dict[int, Any], S: Dict[str, Any]): 
+        def posterior_number_of_contexts(self, context_sequence: Dict[int, Any]): 
             """Compute the posterior over the number of contexts instantiated by the model at each trial, given the context sequences."""           
             # extend context tracking variables if number of trials greater than current size of C
             trial = self.trial
 
             # Ensure shape of all context tracking variables is identical in trial dimension
-            if not (np.shape(self.C)[1] == np.shape(self.mode_number_of_contexts)[0] 
+            if not (np.shape(self.C)[1]
                     == np.shape(self.posterior_mean)[0] 
                     == np.shape(self.posterior_mode)[0] 
                     == np.shape(self.posterior)[1]):
                 raise ValueError("Context tracking variables have inconsistent trial dimensions.")
             
-            existing_trials = np.shape(self.C)[1]
+            existing_trials = np.shape(self.C)[1] - 1
             if existing_trials <  trial:
                 self.C = np.hstack((self.C, np.zeros((self.particles * self.runs, trial - existing_trials), dtype=int)))
-                self.mode_number_of_contexts = np.hstack((self.mode_number_of_contexts, np.zeros((trial - existing_trials, ), dtype=int)))
                 self.posterior = np.hstack((self.posterior, np.zeros((self.max_contexts+1, trial - existing_trials))))
                 self.posterior_mean = np.hstack((self.posterior_mean, np.zeros((trial - existing_trials, ))))
                 self.posterior_mode = np.hstack((self.posterior_mode, np.zeros((trial - existing_trials, ), dtype=int)))
 
-            for i in range(existing_trials, trial):
+            for i in range(existing_trials+1, trial+1):
                 self.C[:, i] = np.max(context_sequence[i], axis=1)
 
-            particle_weight = np.repeat(S["weights"], self.particles) / self.particles
+            particle_weight = np.repeat(np.array([1.0]), self.particles) / self.particles
             
             
-            for i in range(existing_trials, trial):
+            for i in range(existing_trials+1, trial+1):
                 for context in range(np.max(self.C[:, i])):
                     self.posterior[context, i] = np.sum((self.C[:, i] == (context+1)) * particle_weight)
 

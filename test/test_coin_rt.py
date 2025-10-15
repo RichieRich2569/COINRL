@@ -837,3 +837,117 @@ def test_get_prob_parity():
     predr_p = parent.get_predicted_responsibilities(out_p, y_vals)
     predr_c = child.get_predicted_responsibilities(y_vals)
     np.testing.assert_allclose(predr_c, predr_p)
+
+# ---------------------------------------------------------------------
+# Calculating probabilities and finding optimal context labels
+# ---------------------------------------------------------------------
+
+# Context sequence
+def test_context_sequence():
+    """Test context sequence generation."""
+    P = 5; T = 10; C = 4
+    _, coin_rt = import_modules()
+    m = coin_rt.COIN_RT(particles=P, max_contexts=C)
+
+
+    # Build existing context sequence
+    context_seq = {}
+    sampled_contexts = np.random.choice(np.arange(1, C+1), size=[P,T], replace=True)
+    # Rename contexts to appear sequentially
+    for p in range(P):
+        mapping = {x: k for k, x in enumerate(dict.fromkeys(sampled_contexts[p]), 1)}
+        sampled_contexts[p] = np.array([mapping[v] for v in sampled_contexts[p]])
+    # Set our context_seq
+    for i in range(T-1):
+        context_seq[i] = sampled_contexts[:, :i+1]
+
+    # Build mock coin_state
+    # Randomly sample contexts for each trial
+    m.trial = T-1
+    m.context_seq = context_seq.copy()
+    m.initialise_coin(cues_exist=False)
+    m.coin_state["context"] = sampled_contexts[:, T-1]
+    m.coin_state["inds_resampled"] = np.arange(P) # no resampling
+
+
+    seq = m.context_sequence()
+    assert len(seq) == T
+    for t in range(T-1):
+        np.testing.assert_array_equal(seq[t], context_seq[t])
+    np.testing.assert_array_equal(seq[T-1], sampled_contexts)
+
+    # Now with resampling
+    m.trial = T-1
+    m.context_seq = context_seq.copy()
+    m.initialise_coin(cues_exist=False)
+    m.coin_state["context"] = sampled_contexts[:, T-1]
+    m.coin_state["inds_resampled"] = np.ones(P, dtype=int) * 2 # all resampled to particle in index 2
+
+
+    seq = m.context_sequence()
+    assert len(seq) == T
+    np.testing.assert_array_equal(seq[T-1][:, :T-1], sampled_contexts[2,:T-1][None,:].repeat(P, axis=0))
+
+# Test posterior_number_of_contexts
+def test_posterior_number_of_contexts():
+    """Test posterior number of contexts method for COIN_RT."""
+    P = 5; T = 10; nC = 4
+    _, coin_rt = import_modules()
+    m = coin_rt.COIN_RT(particles=P, max_contexts=nC)
+
+    # Context tracking variables with inconsistent size
+    m.C = np.ones((P,T-3), dtype=int) * 3
+    m.posterior = np.zeros((nC+1, T-1))
+    m.posterior_mean = np.zeros((T,))
+    m.posterior_mode = np.zeros((T+1,), dtype=int)
+
+    # Expect ValueError
+    with pytest.raises(ValueError, match="Context tracking variables have inconsistent trial dimensions."):
+        m.posterior_number_of_contexts(None)
+
+    # Build context sequence
+    context_seq = {}
+    sampled_contexts = np.random.choice(np.arange(1, nC+1), size=[P,T], replace=True)
+    # Rename contexts to appear sequentially
+    for p in range(P):
+        mapping = {x: k for k, x in enumerate(dict.fromkeys(sampled_contexts[p]), 1)}
+        sampled_contexts[p] = np.array([mapping[v] for v in sampled_contexts[p]])
+    # Set our context_seq
+    for i in range(T):
+        context_seq[i] = sampled_contexts[:, :i+1]
+    
+    # Set pre-existing values for context tracking variables, now consistent size
+    C = np.ones((P,T), dtype=int) * 3
+    for i in range(T):
+        C[:, i] = np.max(context_seq[i], axis=1)
+
+    posterior = np.zeros((nC+1, T), dtype=float)
+    posterior_mean = np.zeros((T,))
+    posterior_mode = np.zeros((T,), dtype=int)
+    for i in range(T):
+        for context in range(np.max(C[:, i])):
+            posterior[context, i] = np.sum((C[:, i] == (context+1)) * 1/P)
+
+        posterior_mean[i] = np.sum(np.arange(1,nC+2) * posterior[:, i])
+        posterior_mode[i] = np.argmax(posterior[:, i])+1 # contexts seen as 1 and not 0
+    m.C = C[:,:T-3]
+    m.posterior = posterior[:, :T-3]
+    m.posterior_mean = posterior_mean[:T-3]
+    m.posterior_mode = posterior_mode[:T-3]
+
+
+    # Build mock coin_state and run method
+    m.trial = T-1
+    m.posterior_number_of_contexts(context_seq)
+
+    # Verify all context tracking attributes now have the correct size
+    assert m.posterior.shape == (nC+1, T)
+    assert m.posterior_mean.shape == (T,)
+    assert m.posterior_mode.shape == (T,)
+    assert m.C.shape == (P, T)
+
+    # Verify values are correct
+    assert np.allclose(m.posterior, posterior)
+    assert np.allclose(m.posterior_mean, posterior_mean)
+    assert np.array_equal(m.posterior_mode, posterior_mode)
+    assert np.array_equal(m.C, C)
