@@ -951,3 +951,118 @@ def test_posterior_number_of_contexts():
     assert np.allclose(m.posterior_mean, posterior_mean)
     assert np.array_equal(m.posterior_mode, posterior_mode)
     assert np.array_equal(m.C, C)
+
+# 10) find_optimal_context_labels — correctness & incremental behavior
+
+def _apply_perm_1based(seq_1based: np.ndarray, perm_0based: np.ndarray) -> np.ndarray:
+    """
+    Apply a 0-based permutation π to a 1-based labeled sequence:
+    new_label = π[old_label-1] + 1
+    """
+    return (perm_0based[seq_1based - 1] + 1).astype(int)
+
+def test_find_optimal_context_labels_alignment_and_shapes():
+    """
+    Build particles whose sequences are permutations of a common 'latent' sequence.
+    The routine should pick a typical sequence (one of the valid-K ones) and
+    give, for each unique sequence, a permutation that aligns it back to the typical.
+    """
+    _, coin_rt = import_modules()
+    P = 12; T = 6; K = 3
+    m = coin_rt.COIN_RT(particles=P, max_contexts=K)
+
+    # Base latent sequence (1-based labels)
+    base = np.array([1, 2, 3, 1, 2, 3], dtype=int)
+
+    # Build particle sequences as permuted versions of 'base'
+    rng = np.random.RandomState(0)
+    perms = []
+    seqs = np.zeros((P, T), dtype=int)
+    for p in range(P):
+        # Random permutation of 0..K-1, then convert to mapping on 1..K
+        perm0 = rng.permutation(K)             # 0-based vector
+        perms.append(perm0)
+        seqs[p] = _apply_perm_1based(base, perm0)
+
+    # Program expects trial indexing like in context_sequence() tests
+    # We'll compute up to trial = T-1 (so find_optimal_context_labels will do i in [0..T-2])
+    m.trial = T - 1
+    m.context_seq = {i: seqs[:, :i+1] for i in range(T-1)}   # preload past trials
+    m.initialise_coin(cues_exist=False)
+    m.coin_state["inds_resampled"] = np.arange(P, dtype=int) # identity resampling
+    m.coin_state["context"] = seqs[:, T-1]                    # current contexts at trial T-1
+
+    Pout, opt_assign, from_unique, ctx_seq, C = m.find_optimal_context_labels()
+
+    # Inspect last computed trial
+    i = m.trial - 1  # last index computed by the function
+    assert i in opt_assign and i in from_unique
+    perms_tensor = opt_assign[i]   # shape (1, K_i, n_sequences)
+    assert perms_tensor.ndim == 3 and perms_tensor.shape[0] == 1
+    K_i = int(Pout["mode_number_of_contexts"][i])
+    assert perms_tensor.shape[1] == K_i
+
+    # Rebuild the unique sequences at trial i to cross-check the mapping
+    # (mirror the function's logic)
+    max_mode_all = int(np.max(Pout["mode_number_of_contexts"]).astype(int))
+    f_i = np.where(C[:, i] <= max_mode_all)[0]
+    uniq, inds, rev = np.unique(ctx_seq[i][f_i], axis=0, return_index=True, return_inverse=True)
+    n_sequences = uniq.shape[0]
+    assert perms_tensor.shape[2] == n_sequences
+
+    # Typical sequence index (internal cache)
+    assert hasattr(m, "_ocl_cache")
+    t_idx = m._ocl_cache["typical_index_by_trial"][i]
+    typical_seq = uniq[t_idx]
+
+    # For each unique sequence, applying the reported permutation to the TYPICAL sequence
+    # should match that unique sequence (on the observed prefix length)
+    for s in range(n_sequences):
+        perm0 = perms_tensor[0, :, s]  # 0-based π
+        aligned = _apply_perm_1based(typical_seq, perm0)
+        np.testing.assert_array_equal(aligned, uniq[s])
+
+def test_find_optimal_context_labels_incremental_cache():
+    """
+    Verify we only compute new trials incrementally and keep previous results.
+    (We check via cache growth rather than timing.)
+    """
+    _, coin_rt = import_modules()
+    P = 6; T = 5; K = 3
+    m = coin_rt.COIN_RT(particles=P, max_contexts=K)
+
+    # Synthetic sequences where K is constant and equals modal K
+    rng = np.random.RandomState(123)
+    seqs = np.zeros((P, T), dtype=int)
+    for p in range(P):
+        # Make labels sequentially introduced to ensure max label == K
+        s = rng.randint(1, K+1, size=T)
+        # rename to be in 1..K but keep variety
+        mapping = {x: k for k, x in enumerate(dict.fromkeys(s), 1)}
+        seqs[p] = np.array([mapping[v] for v in s])
+
+    # First call up to trial T-2
+    m.trial = T - 1
+    m.context_seq = {i: seqs[:, :i+1] for i in range(T-1)}
+    m.initialise_coin(cues_exist=False)
+    m.coin_state["inds_resampled"] = np.arange(P, dtype=int)
+    m.coin_state["context"] = seqs[:, T-1]
+
+    P1, opt1, fu1, _, _ = m.find_optimal_context_labels()
+    last1 = m._ocl_cache["last_computed_trial"]
+    assert last1 == m.trial - 1
+    size_before = len(opt1)
+
+    # Advance one more trial (append a new column)
+    m.trial = T
+    # Extend context_seq as context_sequence() would do (no resampling here)
+    m.context_seq[T-1] = seqs[:, :T]     # already present; define the "current" row
+    m.coin_state["context"] = seqs[:, T-1]  # reuse last available
+    m.coin_state["inds_resampled"] = np.arange(P, dtype=int)
+
+    P2, opt2, fu2, _, _ = m.find_optimal_context_labels()
+    last2 = m._ocl_cache["last_computed_trial"]
+    assert last2 == T - 1
+    assert len(opt2) == size_before + 1
+    # Previously computed trials still present and identical by keys
+    assert set(opt1.keys()).issubset(set(opt2.keys()))

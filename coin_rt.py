@@ -235,11 +235,15 @@ class COIN_RT(coin.COIN):
 
             # Label-alignment cache
             self._ocl_cache = dict(
-                f = dict(),
-                to_unique = dict(),
-                from_unique = dict(),
-                optimal_assignment = dict()
+                last_computed_trial=-1,           # last i for which we computed results
+                optimal_assignment=dict(),        # {i: np.ndarray shape (1, K_i, n_sequences)}
+                from_unique=dict(),               # {i: reverse_inds from np.unique}
+                to_unique=dict(),                 # {i: inds from np.unique}
+                typical_index_by_trial=dict(),    # {i: int index into unique seqs}
             )
+
+            self.n_particles_used = np.zeros((0,))
+
 
 
 
@@ -367,125 +371,264 @@ class COIN_RT(coin.COIN):
             S["properties"] = self
             return S
         
+        def _contingency_matrix(self, seq_a: np.ndarray, seq_b: np.ndarray) -> np.ndarray:
+            """
+            Build a K×K contingency matrix of co-occurrences between labels in seq_a and seq_b.
+            Labels are 1-based; matrix is indexed 0..K-1.
+            K is chosen as max label seen in either sequence.
+            """
+            assert seq_a.ndim == 1 and seq_b.ndim == 1
+            assert seq_a.shape[0] == seq_b.shape[0]
+            K = int(max(seq_a.max(initial=1), seq_b.max(initial=1)))
+            M = np.zeros((K, K), dtype=int)
+            # 1-based -> 0-based
+            for a, b in zip(seq_a, seq_b):
+                M[a - 1, b - 1] += 1
+            return M
+
+        @staticmethod
+        def _hungarian_min(cost: np.ndarray):
+            """
+            Minimal Hungarian algorithm (square cost, dense) for small K (<= ~10).
+            Returns (row_ind, col_ind) minimizing total cost.
+            No SciPy dependency.
+            """
+            cost = np.asarray(cost, dtype=float).copy()
+            n = cost.shape[0]
+            assert cost.shape == (n, n)
+
+            # Step 1: subtract row mins, then col mins
+            cost -= cost.min(axis=1, keepdims=True)
+            cost -= cost.min(axis=0, keepdims=True)
+
+            # Masks and covers
+            starred = np.zeros((n, n), dtype=bool)
+            primed = np.zeros((n, n), dtype=bool)
+            row_cov = np.zeros(n, dtype=bool)
+            col_cov = np.zeros(n, dtype=bool)
+
+            # Step 2: star independent zeros
+            for r in range(n):
+                for c in range(n):
+                    if (cost[r, c] == 0) and not row_cov[r] and not col_cov[c]:
+                        starred[r, c] = True
+                        row_cov[r] = True
+                        col_cov[c] = True
+                        break
+            row_cov[:] = False
+            col_cov[:] = np.any(starred, axis=0)
+
+            def find_zero():
+                for r in range(n):
+                    if row_cov[r]:
+                        continue
+                    for c in range(n):
+                        if (not col_cov[c]) and cost[r, c] == 0 and not starred[r, c] and not primed[r, c]:
+                            return r, c
+                return None
+
+            def find_star_in_row(r):
+                cs = np.where(starred[r])[0]
+                return cs[0] if cs.size else None
+
+            def find_star_in_col(c):
+                rs = np.where(starred[:, c])[0]
+                return rs[0] if rs.size else None
+
+            def find_prime_in_row(r):
+                cs = np.where(primed[r])[0]
+                return cs[0] if cs.size else None
+
+            def augment_path(start_r, start_c):
+                # Build alternating path starting from primed zero at (start_r, start_c)
+                path = [(start_r, start_c)]
+                done = False
+                while not done:
+                    r = np.where(starred[:, path[-1][1]])[0]
+                    if r.size:
+                        r = r[0]
+                        path.append((r, path[-1][1]))
+                    else:
+                        done = True
+                        break
+                    c = np.where(primed[r])[0]
+                    c = c[0]
+                    path.append((r, c))
+                # Flip stars along path
+                for (r, c) in path:
+                    starred[r, c] = not starred[r, c]
+                # Clear primes and covers
+                primed[:, :] = False
+
+            # Main loop
+            while True:
+                if np.sum(col_cov) == n:
+                    break
+                z = find_zero()
+                while z is None:
+                    # Step: adjust matrix
+                    uncovered = cost[~row_cov][:, ~col_cov]
+                    m = uncovered.min() if uncovered.size else 0.0
+                    cost[ row_cov, : ] += m
+                    cost[:, ~col_cov] -= m
+                    z = find_zero()
+
+                r, c = z
+                primed[r, c] = True
+                star_c = find_star_in_row(r)
+                if star_c is not None:
+                    # Cover row, uncover the star's column, continue
+                    row_cov[r] = True
+                    col_cov[star_c] = False
+                else:
+                    # Augmenting path starts
+                    augment_path(r, c)
+                    row_cov[:] = False
+                    col_cov[:] = np.any(starred, axis=0)
+
+            # Extract assignment from starred zeros
+            row_ind = np.arange(n)
+            col_ind = np.argmax(starred, axis=1)
+            return row_ind, col_ind
+
+        def _optimal_hamming_matrix(self, unique_seqs: np.ndarray) -> np.ndarray:
+            """
+            Compute pairwise *optimally relabeled* Hamming distances between unique sequences.
+            Uses Hungarian on contingency counts (max assignment ↔ max label agreements).
+            Sequences contain 1-based labels. Returns H_opt of shape (S, S).
+            """
+            S, L = unique_seqs.shape
+            H = np.zeros((S, S), dtype=float)
+            for a in range(S):
+                H[a, a] = 0.0
+                for b in range(a + 1, S):
+                    M = self._contingency_matrix(unique_seqs[a], unique_seqs[b])  # K×K
+                    # Maximize matches ⇒ minimize (max - M)
+                    maxv = M.max(initial=0)
+                    cost = (maxv - M).astype(float)
+                    # Pad to square if needed (safety; should already be square K×K)
+                    if cost.shape[0] != cost.shape[1]:
+                        K = max(cost.shape)
+                        pad = np.zeros((K, K), dtype=float)
+                        pad[:cost.shape[0], :cost.shape[1]] = cost
+                        cost = pad
+                    r, c = self._hungarian_min(cost)
+                    matches = int(M[r, c].sum())
+                    Hval = L - matches
+                    H[a, b] = Hval
+                    H[b, a] = Hval
+            return H
+
+        def _perm_from_assignment(self, typical_seq: np.ndarray, other_seq: np.ndarray, K_target: int) -> np.ndarray:
+            """
+            Compute the 0-based permutation π of length K_target that maps labels of the
+            typical sequence to labels of the other sequence by maximizing agreements.
+            """
+            M = self._contingency_matrix(typical_seq, other_seq)  # K×K for observed labels
+            maxv = M.max(initial=0)
+            cost = (maxv - M).astype(float)
+            if cost.shape[0] != cost.shape[1]:
+                K = max(cost.shape)
+                pad = np.zeros((K, K), dtype=float)
+                pad[:cost.shape[0], :cost.shape[1]] = cost
+                cost = pad
+            r, c = self._hungarian_min(cost)  # row r (typical label index) → column c (other label index)
+            mapping = dict(zip(r.tolist(), c.tolist()))
+            # Build 0-based permutation of length K_target (labels 1..K_target → 0..K_target-1)
+            perm = np.arange(K_target, dtype=int)
+            for lab in range(K_target):       # lab is 0-based label index for typical
+                perm[lab] = mapping.get(lab, lab)
+                # Clamp in case 'other' has labels beyond K_target (won't matter for valid-K sequences)
+                if perm[lab] >= K_target:
+                    perm[lab] = lab
+            return perm
+
+        
         def find_optimal_context_labels(self):
             """
-               Find the optimal context labels for plotting by minimising the Hamming distance between context sequences across particles.
-               Real-time option, which updates the optimal context labels once per trial.
+            Incremental, assignment-based (Hungarian) optimal label alignment.
+
+            Returns:
+            P: dict with P["mode_number_of_contexts"] = array[T] (modal K per trial)
+            optimal_assignment: dict[i] -> np.ndarray of shape (1, K_i, n_sequences_i)
+                Each column is a 0-based permutation vector π aligning the "typical"
+                sequence's labels (1..K_i) to that sequence at trial i.
+            from_unique: dict[i] -> reverse indices from np.unique for particles kept at i
+            context_sequence: dict[trial] -> (P, trial+1) array (1-based labels)
+            C: (R*P, T) array: instantiated #contexts per particle/trial
             """
-            # A dict form {trial: array of shape [P,trial]} where we follow the context sequence for each particle up to the given trial
-            context_sequence = self.context_sequence() # Generate new value for current trial
-
-            # Obtain the number of instantiated contexts for each particle as they vary per trial
-            # - C: array of shape [R*P,T] with the number of instantiated contexts for each particle at each trial
-            # - mode_number_of_contexts: array of shape [T] with modal number of instantiated contexts across particles at each trial
+            # Rebuild or extend context sequences for the *current* trial
+            context_sequence = self.context_sequence()  # dict {trial: (P, trial+1)}
+            # Compute posterior #contexts and modal counts across trials
             C, _, _, mode_number_of_contexts = self.posterior_number_of_contexts(context_sequence)
-            
-            P = {}
-            P["mode_number_of_contexts"] = mode_number_of_contexts
-            
-            # context label permutations
 
-            # All possible permutations of context labels up to the maximum number of contexts
-            L = np.array(list(permutations(np.arange(0,np.max(mode_number_of_contexts).astype(int)))))
-
-            # Rearrange shape so that L has shape [max_mode_number_of_contexts, 1, num_permutations], also obtain number of permutations
-            L = np.transpose(L[None], (2, 0, 1))
-            n_perms = factorial(np.max(mode_number_of_contexts).astype(int))
-
-            # Obtain variables from cache
-            f = self._ocl_cache["f"]
-            to_unique = self._ocl_cache["to_unique"]
-            from_unique = self._ocl_cache["from_unique"]
+            P = {"mode_number_of_contexts": mode_number_of_contexts}
             optimal_assignment = self._ocl_cache["optimal_assignment"]
+            from_unique = self._ocl_cache["from_unique"]
+            to_unique = self._ocl_cache["to_unique"]
+            typical_index_by_trial = self._ocl_cache["typical_index_by_trial"]
 
-            i = self.trial # current trial
-            
-            # exclude sequences for which C > max(mode_number_of_context) as these sequences
-            # (and their descendents) will never be analysed
-            f[i] = np.where(C[:, i] <= np.max(mode_number_of_contexts))[0]
-            
-            # identify unique sequences (to avoid performing the same computations multiple times)
-            unique_seqs, inds, reverse_inds = np.unique(
-                context_sequence[i][f[i]], axis=0, return_index=True, return_inverse=True
-            )
-            to_unique[i] = inds
-            from_unique[i] = reverse_inds
-            
-            n_sequences = len(unique_seqs)
-            
-            # identify particles that have the same number of contexts as the most common number of
-            # contexts (only contexts (only these particles will be analysed)
-            valid_particle_inds = (C[f[i], i] == mode_number_of_contexts[i])
-            
-            if i == 0:
-                # hamming distances on trial 0
-                # dimension 2 of H considers all possible label permutations
-                H = (L[[0], :, :] != 0) * 1.0 # (1, 1, num_permutations)
-            else:
-                # identify a valid parent of each unique sequence
-                # i.e., a sequence on the previous trial that is identical up to the previous trial
-                inds, _ = np.where(f[i-1][:, None] == self.coin_state["inds_resampled"][f[i][to_unique[i]], i][None])
-                parent = from_unique[i-1][inds]
-                
-                # pass Hamming distances from parents to children
-                inds_1 = np.tile(parent[:, None, None], [1, n_sequences, n_perms])
-                inds_2 = np.tile(parent[None, :, None], [n_sequences, 1, n_perms])
-                inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
-                
-                H_new = np.zeros((n_sequences, n_sequences, n_perms))
-                
-                for ii in range(n_sequences):
-                    for jj in range(n_sequences):
-                        for kk in range(n_perms):
-                            H_new[ii, jj, kk] = H[inds_1[ii, jj, kk], inds_2[ii, jj, kk], inds_3[ii, jj, kk]]
-                
-                # recursively update Hamming distances
-                # dimension 2 of H considers all possible label permutations
-                for seq in range(n_sequences):
-                    H_new[seq:, [seq], :] = H_new[seq:, [seq], :] + ((unique_seqs[seq, -1]-1) != L[unique_seqs[seq:, -1]-1, :, :]) * 1.0
-                    H_new[seq, seq:, :] = H_new[seq:, seq, :] # by symmetry of Hamming distance
-                
-                H = H_new
-            
-            # compute the Hamming distance between each pair of sequences (after optimally permuting labels)
-            H_optimal = np.min(H, axis=2)
-            
-            # count the number of times each unique sequence occurs
-            sequence_count = np.sum(
-                from_unique[i][valid_particle_inds][:, None] == np.arange(len(unique_seqs))[None], 
-                axis=0, 
-            )
-            
-            # compute the mean optimal Hamming distance of each sequence to all other sequences.
-            # the distance from sequence i to sequence j is weighted by the number of times sequence j occurs.
-            # if i == j, this weight is reduced by 1 so that the distance from one instance of sequence i to itself is ignored.
-            H_mean = np.mean(H_optimal * (sequence_count[None] - np.eye(n_sequences)), axis=1)
-            
-            # assign infinite distance to invalid sequences 
-            # i.e., sequences for which the number of contexts is not equal to the most common number of contexts
-            H_mean[sequence_count == 0] = np.inf
-            
-            # find the index of the typical sequence 
-            # (the sequence with minimum mean optimal Hamming distance to all other sequences)
-            min_ind = np.argmin(H_mean, axis=0)
-            
-            # typical context sequence
-            typical_sequence = unique_seqs[min_ind, :]
-            
-            # store the optimal permutation of labels for each sequence with respect to the typical sequence
-            j = np.argmin(H[min_ind, :, :], axis=-1)
-            optimal_assignment[i] = np.transpose(
-                L[:int(mode_number_of_contexts[i]), :, j].reshape((int(mode_number_of_contexts[i]), -1, 1)), 
-                [2, 0, 1], 
-            )
+            # Compute only for *new* trials since last call
+            start_i = int(self._ocl_cache["last_computed_trial"]) + 1
+            end_i = int(self.trial)  # original code loops i in range(self.trial)
+            if start_i < 0:
+                start_i = 0
 
-            # store back in cache
-            self._ocl_cache["f"] = f
-            self._ocl_cache["to_unique"] = to_unique
-            self._ocl_cache["from_unique"] = from_unique
-            self._ocl_cache["optimal_assignment"] = optimal_assignment
-        
+            # Constant used in original filter: allow sequences with contexts up to the global max modal
+            max_mode_all = int(np.max(mode_number_of_contexts).astype(int)) if mode_number_of_contexts.size else 0
+
+            for i in range(start_i, end_i):
+                # Filter particles whose C <= global max modal (exclude never-to-be-analysed descendants)
+                f_i = np.where(C[:, i] <= max_mode_all)[0]
+
+                # Unique sequences among the filtered particles (for trial i, using prefix 0..i)
+                uniq, inds, rev = np.unique(context_sequence[i][f_i], axis=0, return_index=True, return_inverse=True)
+                to_unique[i] = inds
+                from_unique[i] = rev
+                n_sequences = uniq.shape[0]
+
+                # Keep only particles with modal K at trial i
+                K_i = int(mode_number_of_contexts[i])
+                valid_particle_mask = (C[f_i, i] == K_i)
+
+                # Count how many times each unique sequence occurs among valid-K particles
+                seq_ids = from_unique[i][valid_particle_mask]
+                sequence_count = np.bincount(seq_ids, minlength=n_sequences).astype(int)
+
+                # Pairwise optimally-relabeled Hamming distances among unique sequences
+                H_opt = self._optimal_hamming_matrix(uniq)
+
+                # Weighted mean distance of each sequence to all others
+                #   weight(j) = sequence_count[j], but reduce self-weight by 1
+                W = np.repeat(sequence_count[None, :], n_sequences, axis=0)
+                diag = np.arange(n_sequences)
+                W[diag, diag] = np.maximum(W[diag, diag] - 1, 0)
+                denom = W.sum(axis=1).astype(float)
+                denom[denom == 0] = 1.0  # avoid /0; these will be invalidated below
+                H_mean = (H_opt * W).sum(axis=1) / denom
+
+                # Invalidate sequences that never occur among valid-K particles
+                H_mean[sequence_count == 0] = np.inf
+
+                # Typical sequence: minimal weighted mean distance (medoid under optimal relabeling)
+                min_ind = int(np.argmin(H_mean))
+                typical_index_by_trial[i] = min_ind
+                typical_seq = uniq[min_ind]
+
+                # Build per-sequence optimal permutation that aligns typical -> sequence
+                # Output shape: (1, K_i, n_sequences)
+                perms = np.zeros((K_i, n_sequences), dtype=int)
+                for s in range(n_sequences):
+                    perm = self._perm_from_assignment(typical_seq, uniq[s], K_target=K_i)  # 0-based π
+                    perms[:, s] = perm
+
+                optimal_assignment[i] = perms[None, :, :]  # (1, K_i, n_sequences)
+
+                # Book-keeping: mark last computed trial
+                self._ocl_cache["last_computed_trial"] = i
+
             return P, optimal_assignment, from_unique, context_sequence, C
+
         
         def context_sequence(self):
             """Reconstruct the context sequence for each particle in each run, after resampling. Rebuild for RT version."""
@@ -536,6 +679,68 @@ class COIN_RT(coin.COIN):
                 self.posterior_mode[i] = np.argmax(self.posterior[:, i])+1 # contexts seen as 1 and not 0
 
             return self.C, self.posterior, self.posterior_mean, self.posterior_mode
+        
+        def compute_variables_for_plotting(
+                self, 
+                P: Dict[str, Any], 
+                S: Dict[str, Any], 
+                optimal_assignment: Dict[int, Any], 
+                from_unique: Dict[int, Any], 
+                context_sequence: Dict[int, Any], 
+                C: np.ndarray, 
+            ):         
+            P = self.preallocate_memory(P)
+            
+            # cumulative number of particles for which C <= np.max(P["mode_number_of_contexts"])
+            N = 0
+            i = self.trial
+
+            # expand n_particles_used if size is less than trial
+            if np.shape(self.n_particles_used)[0] < self.trial + 1:
+                n_particles_used = np.zeros((self.trial + 1, 1), dtype=int)
+                if np.shape(self.n_particles_used)[0] > 0:
+                    n_particles_used[:np.shape(self.n_particles_used)[0], :] = self.n_particles_used
+                self.n_particles_used = n_particles_used
+
+            # inds of particles that are either valid now or could be valid in the future
+            # C <= np.max(P["mode_number_of_contexts"])
+            valid_future = np.where(C[:, i] <= np.max(P["mode_number_of_contexts"]))[0]
+            
+            # inds of particles that are valid now
+            # C == np.max(P["mode_number_of_contexts"])
+            valid_now = np.where(C[:, i] == P["mode_number_of_contexts"][i])[0]
+            n_particles_used[i, 0] = len(valid_now)
+
+            if len(valid_now) > 0:
+                for particle in valid_now:
+                    # index of the optimal label permutations of the current particle
+                    ind = N + np.where(particle == valid_future)[0]
+                    
+                    # is the latest context a novel context
+                    # this is needed to store novel context probabilities
+                    context_trajectory = context_sequence[i][particle, :]
+                    
+                    if i > 0:
+                        novel_context = context_trajectory[i] > np.max(context_trajectory[:i])
+                    else:
+                        novel_context = False
+
+                    S = self.relabel_context_variables(S, optimal_assignment[i][0, :, from_unique[i][ind][0]].astype(int), novel_context, particle, i, 0)
+                P = self.integrate_over_particles(S, P, valid_now, i, 0)
+            
+            N += len(valid_future)
+            
+            P = self.integrate_over_runs(P, S)
+            P = self.normalise_relabelled_variables(P, n_particles_used, S)
+            
+            if self.plot_state_given_context:
+                P["state_given_novel_context"] = np.tile(
+                    np.nanmean(P["state_given_context"][:, :, -1], axis=1, keepdims=True)[:,:,None], 
+                    [1, self.trial, 1], 
+                )
+                P["state_given_context"] = P["state_given_context"][:, :, :-1]
+            
+            return P, S
 
         def predict_context(self, coin_state: Dict[str, Any], cue: Optional[int] = None) -> Dict[str, Any]:
             # Check if cues are provided when cues_exist is True
