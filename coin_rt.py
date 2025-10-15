@@ -233,6 +233,14 @@ class COIN_RT(coin.COIN):
             self.posterior_mean = np.zeros((1, ))
             self.posterior_mode = np.zeros((1, ), dtype=int)
 
+            # Label-alignment cache
+            self._ocl_cache = dict(
+                f = dict(),
+                to_unique = dict(),
+                from_unique = dict(),
+                optimal_assignment = dict()
+            )
+
 
 
         def initialise_coin(self, cues_exist: bool):
@@ -383,92 +391,99 @@ class COIN_RT(coin.COIN):
             # Rearrange shape so that L has shape [max_mode_number_of_contexts, 1, num_permutations], also obtain number of permutations
             L = np.transpose(L[None], (2, 0, 1))
             n_perms = factorial(np.max(mode_number_of_contexts).astype(int))
+
+            # Obtain variables from cache
+            f = self._ocl_cache["f"]
+            to_unique = self._ocl_cache["to_unique"]
+            from_unique = self._ocl_cache["from_unique"]
+            optimal_assignment = self._ocl_cache["optimal_assignment"]
+
+            i = self.trial # current trial
             
-            f = {}
-            to_unique = {}
-            from_unique = {}
-            optimal_assignment = {}
+            # exclude sequences for which C > max(mode_number_of_context) as these sequences
+            # (and their descendents) will never be analysed
+            f[i] = np.where(C[:, i] <= np.max(mode_number_of_contexts))[0]
             
-            # Loop through all trials up to the current time point - run time increases with number of trials
-            for i in range(self.trial):        
-                # exclude sequences for which C > max(mode_number_of_context) as these sequences
-                # (and their descendents) will never be analysed
-                f[i] = np.where(C[:, i] <= np.max(mode_number_of_contexts))[0]
+            # identify unique sequences (to avoid performing the same computations multiple times)
+            unique_seqs, inds, reverse_inds = np.unique(
+                context_sequence[i][f[i]], axis=0, return_index=True, return_inverse=True
+            )
+            to_unique[i] = inds
+            from_unique[i] = reverse_inds
+            
+            n_sequences = len(unique_seqs)
+            
+            # identify particles that have the same number of contexts as the most common number of
+            # contexts (only contexts (only these particles will be analysed)
+            valid_particle_inds = (C[f[i], i] == mode_number_of_contexts[i])
+            
+            if i == 0:
+                # hamming distances on trial 0
+                # dimension 2 of H considers all possible label permutations
+                H = (L[[0], :, :] != 0) * 1.0 # (1, 1, num_permutations)
+            else:
+                # identify a valid parent of each unique sequence
+                # i.e., a sequence on the previous trial that is identical up to the previous trial
+                inds, _ = np.where(f[i-1][:, None] == self.coin_state["inds_resampled"][f[i][to_unique[i]], i][None])
+                parent = from_unique[i-1][inds]
                 
-                # identify unique sequences (to avoid performing the same computations multiple times)
-                unique_seqs, inds, reverse_inds = np.unique(
-                    context_sequence[i][f[i]], axis=0, return_index=True, return_inverse=True
-                )
-                to_unique[i] = inds
-                from_unique[i] = reverse_inds
+                # pass Hamming distances from parents to children
+                inds_1 = np.tile(parent[:, None, None], [1, n_sequences, n_perms])
+                inds_2 = np.tile(parent[None, :, None], [n_sequences, 1, n_perms])
+                inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
                 
-                n_sequences = len(unique_seqs)
+                H_new = np.zeros((n_sequences, n_sequences, n_perms))
                 
-                # identify particles that have the same number of contexts as the most common number of
-                # contexts (only contexts (only these particles will be analysed)
-                valid_particle_inds = (C[f[i], i] == mode_number_of_contexts[i])
+                for ii in range(n_sequences):
+                    for jj in range(n_sequences):
+                        for kk in range(n_perms):
+                            H_new[ii, jj, kk] = H[inds_1[ii, jj, kk], inds_2[ii, jj, kk], inds_3[ii, jj, kk]]
                 
-                if i == 0:
-                    # hamming distances on trial 0
-                    # dimension 2 of H considers all possible label permutations
-                    H = (L[[0], :, :] != 0) * 1.0 # (1, 1, num_permutations)
-                else:
-                    # identify a valid parent of each unique sequence
-                    # i.e., a sequence on the previous trial that is identical up to the previous trial
-                    inds, _ = np.where(f[i-1][:, None] == self.inds_resampled[f[i][to_unique[i]], i][None])
-                    parent = from_unique[i-1][inds]
-                    
-                    # pass Hamming distances from parents to children
-                    inds_1 = np.tile(parent[:, None, None], [1, n_sequences, n_perms])
-                    inds_2 = np.tile(parent[None, :, None], [n_sequences, 1, n_perms])
-                    inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
-                    
-                    H_new = np.zeros((n_sequences, n_sequences, n_perms))
-                    
-                    for ii in range(n_sequences):
-                        for jj in range(n_sequences):
-                            for kk in range(n_perms):
-                                H_new[ii, jj, kk] = H[inds_1[ii, jj, kk], inds_2[ii, jj, kk], inds_3[ii, jj, kk]]
-                    
-                    # recursively update Hamming distances
-                    # dimension 2 of H considers all possible label permutations
-                    for seq in range(n_sequences):
-                        H_new[seq:, [seq], :] = H_new[seq:, [seq], :] + ((unique_seqs[seq, -1]-1) != L[unique_seqs[seq:, -1]-1, :, :]) * 1.0
-                        H_new[seq, seq:, :] = H_new[seq:, seq, :] # by symmetry of Hamming distance
-                    
-                    H = H_new
+                # recursively update Hamming distances
+                # dimension 2 of H considers all possible label permutations
+                for seq in range(n_sequences):
+                    H_new[seq:, [seq], :] = H_new[seq:, [seq], :] + ((unique_seqs[seq, -1]-1) != L[unique_seqs[seq:, -1]-1, :, :]) * 1.0
+                    H_new[seq, seq:, :] = H_new[seq:, seq, :] # by symmetry of Hamming distance
                 
-                # compute the Hamming distance between each pair of sequences (after optimally permuting labels)
-                H_optimal = np.min(H, axis=2)
-                
-                # count the number of times each unique sequence occurs
-                sequence_count = np.sum(
-                    from_unique[i][valid_particle_inds][:, None] == np.arange(len(unique_seqs))[None], 
-                    axis=0, 
-                )
-                
-                # compute the mean optimal Hamming distance of each sequence to all other sequences.
-                # the distance from sequence i to sequence j is weighted by the number of times sequence j occurs.
-                # if i == j, this weight is reduced by 1 so that the distance from one instance of sequence i to itself is ignored.
-                H_mean = np.mean(H_optimal * (sequence_count[None] - np.eye(n_sequences)), axis=1)
-                
-                # assign infinite distance to invalid sequences 
-                # i.e., sequences for which the number of contexts is not equal to the most common number of contexts
-                H_mean[sequence_count == 0] = np.inf
-                
-                # find the index of the typical sequence 
-                # (the sequence with minimum mean optimal Hamming distance to all other sequences)
-                min_ind = np.argmin(H_mean, axis=0)
-                
-                # typical context sequence
-                typical_sequence = unique_seqs[min_ind, :]
-                
-                # store the optimal permutation of labels for each sequence with respect to the typical sequence
-                j = np.argmin(H[min_ind, :, :], axis=-1)
-                optimal_assignment[i] = np.transpose(
-                    L[:int(mode_number_of_contexts[i]), :, j].reshape((int(mode_number_of_contexts[i]), -1, 1)), 
-                    [2, 0, 1], 
-                )
+                H = H_new
+            
+            # compute the Hamming distance between each pair of sequences (after optimally permuting labels)
+            H_optimal = np.min(H, axis=2)
+            
+            # count the number of times each unique sequence occurs
+            sequence_count = np.sum(
+                from_unique[i][valid_particle_inds][:, None] == np.arange(len(unique_seqs))[None], 
+                axis=0, 
+            )
+            
+            # compute the mean optimal Hamming distance of each sequence to all other sequences.
+            # the distance from sequence i to sequence j is weighted by the number of times sequence j occurs.
+            # if i == j, this weight is reduced by 1 so that the distance from one instance of sequence i to itself is ignored.
+            H_mean = np.mean(H_optimal * (sequence_count[None] - np.eye(n_sequences)), axis=1)
+            
+            # assign infinite distance to invalid sequences 
+            # i.e., sequences for which the number of contexts is not equal to the most common number of contexts
+            H_mean[sequence_count == 0] = np.inf
+            
+            # find the index of the typical sequence 
+            # (the sequence with minimum mean optimal Hamming distance to all other sequences)
+            min_ind = np.argmin(H_mean, axis=0)
+            
+            # typical context sequence
+            typical_sequence = unique_seqs[min_ind, :]
+            
+            # store the optimal permutation of labels for each sequence with respect to the typical sequence
+            j = np.argmin(H[min_ind, :, :], axis=-1)
+            optimal_assignment[i] = np.transpose(
+                L[:int(mode_number_of_contexts[i]), :, j].reshape((int(mode_number_of_contexts[i]), -1, 1)), 
+                [2, 0, 1], 
+            )
+
+            # store back in cache
+            self._ocl_cache["f"] = f
+            self._ocl_cache["to_unique"] = to_unique
+            self._ocl_cache["from_unique"] = from_unique
+            self._ocl_cache["optimal_assignment"] = optimal_assignment
         
             return P, optimal_assignment, from_unique, context_sequence, C
         
