@@ -185,12 +185,13 @@ class CustomPendulumEnv(TimeLimitMixin, PendulumEnv):
             img = None
 
         if img is not None and self.last_u is not None:
+            arrow_size = int(scale * abs(self.last_u) / 2)
+            # Ensure at least 1 px so pygame doesn't get (0, 0)
+            arrow_size = max(1, arrow_size)
+
             arrow = pygame.transform.smoothscale(
                 img,
-                (
-                    scale * abs(self.last_u) / 2,
-                    scale * abs(self.last_u) / 2,
-                ),
+                (arrow_size, arrow_size),
             )
             arrow = pygame.transform.flip(arrow, self.last_u > 0, True)
             self.surf.blit(
@@ -200,6 +201,7 @@ class CustomPendulumEnv(TimeLimitMixin, PendulumEnv):
                     offset - arrow.get_rect().centery,
                 ),
             )
+
         # Axle cap
         gfxdraw.aacircle(self.surf, offset, offset, int(0.05 * scale), (0, 0, 0))
         gfxdraw.filled_circle(self.surf, offset, offset, int(0.05 * scale), (0, 0, 0))

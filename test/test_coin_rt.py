@@ -118,7 +118,7 @@ def test_init_defaults_without_cues():
     assert model.trial == 0
     assert model.max_cues == 10
     assert isinstance(model.coin_state, dict)
-    assert model.perturbations == []
+    assert model.perturbations.size == 0
     assert model.cues is None
 
     # cue-related fields should be absent
@@ -176,7 +176,7 @@ def test_reinitialise_toggles_cue_fields_and_resets_bookkeeping():
 
     # Defaults (cues off)
     assert model.coin_state["cues_exist"] == 0
-    assert model.perturbations == []
+    assert model.perturbations.size == 0
     assert model.cues is None
 
     # Mutate to verify reset
@@ -218,8 +218,6 @@ def test_parameter_overrides_reflected_if_exposed():
         alpha_cue=12.0,
         infer_bias=True,
         prior_precision_bias=50.0,
-        runs=2,
-        max_cores=4,
         particles=32,
         max_contexts=3,
         max_cues=4,
@@ -287,7 +285,7 @@ def test_step_warns_when_cue_provided_but_cues_do_not_exist(model_no_cues, capsy
     res = m.step(state_feedback=0.2, cue=1)
     out = capsys.readouterr().out
     assert "Warning: Cue provided but cues_exist is False" in out
-    assert isinstance(res, dict) and {"runs", "weights", "properties"} <= set(res.keys())
+    assert isinstance(res, dict) and {"runs", "properties"} <= set(res.keys())
     assert set(res["runs"].keys()) == set(range(m.runs))
 
 
@@ -564,7 +562,7 @@ def test_rt_determinism_same_seed_same_inputs_same_outputs():
     """
     _, coin_rt = import_modules()
     SEED = 20250930
-    common_kwargs = dict(particles=7, max_contexts=5, max_cores=0)
+    common_kwargs = dict(particles=7, max_contexts=5)
     y_seq = np.array([0.2, 0.1, np.nan, 0.0, -0.3, 0.7], dtype=float)
 
     # Run 1

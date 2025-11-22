@@ -339,16 +339,16 @@ class COIN_RT(coin.COIN):
         
         def get_predicted_probabilities(self):
             # Get predicted probabilities p(c_t | y_{1:t-1}, ...) from model
-            #TODO: very inefficient, runs for all iterations. Optimise later.
             S = self._build_output()
             prob = super().get_predicted_probabilities(S)
             return super().get_predicted_probabilities(S)
         
         def get_responsibilities(self, separate_novel: bool = True):
             # Get responsibilities p(c_t | y_{1:t}, ...) from model
-            #TODO: very inefficient, runs for all iterations. Optimise later.
             S = self._build_output()
-            known, novel = super().get_responsibilities(S)
+            P, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels()
+            P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
+            known, novel = P["known_context_responsibilities"], P["novel_context_responsibility"]
             if self.coin_state["trial"] > 0:
                 known = known[-1,:] # Get last trial only
                 novel = novel[-1,:] # Get last trial only
@@ -359,7 +359,6 @@ class COIN_RT(coin.COIN):
         
         def get_predicted_responsibilities(self, y):
             # Get predicted responsibilities p(c_t | y_{1:t}, ...) for a given observation y
-            #TODO: very inefficient, runs for all iterations. Optimise later.
             S = self._build_output()
             return super().get_predicted_responsibilities(S, y)
         

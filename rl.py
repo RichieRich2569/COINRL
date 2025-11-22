@@ -854,12 +854,10 @@ class _MLP(nn.Module):
 class PPOAgent:
     """
     Vanilla PPO (clip) agent.
-    call train_step(env, n_steps) to collect a rollout and do one update.
     """
     def __init__(
         self,
-        obs_dim: int,
-        act_dim: int,
+        env: gym.Env,           # PPO Agent form depends on the environment it is being applied to
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_eps: float = 0.2,
@@ -867,40 +865,112 @@ class PPOAgent:
         ent_coef: float = 0.0,
         vf_coef: float = 0.5,
         device: str = "cpu",
-        action_continuous: bool = False
     ):
         self.gamma, self.lam = gamma, gae_lambda
         self.clip_eps, self.ent_coef, self.vf_coef = clip_eps, ent_coef, vf_coef
         self.device = device
-        
-        self.action_continuous = action_continuous
 
-        self.policy = _MLP(obs_dim, act_dim).to(device)
-        self.value_net = _MLP(obs_dim, 1).to(device)
-        self.optim = optim.Adam(
-            list(self.policy.parameters()) + list(self.value_net.parameters()),
-            lr=lr
-        )
+        # ----- Infer observation / action spaces from the env -----
+        obs_space = env.observation_space
+        act_space = env.action_space
+
+        # This version assumes continuous (Box) observations.
+        # If you have Dict / Discrete obs etc., encoder is needed.
+        assert isinstance(obs_space, gym.spaces.Box), \
+            "This PPOAgent currently supports only Box observation spaces."
+
+        self.obs_dim = int(np.prod(obs_space.shape))
+
+        # Determine whether the action space is discrete or continuous
+        if isinstance(act_space, gym.spaces.Discrete):
+            self.action_continuous = False
+            self.act_dim = act_space.n
+            self.act_low = None
+            self.act_high = None
+        elif isinstance(act_space, gym.spaces.Box):
+            self.action_continuous = True
+            assert len(act_space.shape) == 1, \
+                "Only 1D Box action spaces are supported (shape = (act_dim,))."
+            self.act_dim = act_space.shape[0]
+            # Store bounds as tensors
+            self.act_low = torch.as_tensor(
+                act_space.low, device=self.device, dtype=torch.float32
+            )
+            self.act_high = torch.as_tensor(
+                act_space.high, device=self.device, dtype=torch.float32
+            )
+        else:
+            raise NotImplementedError(
+                f"Action space type {type(act_space)} not supported. "
+                "Only Discrete and 1D Box are supported."
+            )
+
+        # ----- Networks -----
+        self.policy = _MLP(self.obs_dim, self.act_dim).to(device)
+        self.value_net = _MLP(self.obs_dim, 1).to(device)
+
+        # For continuous actions, keep a learnable log_std
+        if self.action_continuous:
+            self.log_std = nn.Parameter(torch.zeros(self.act_dim, device=device))
+        else:
+            self.log_std = None
+
+        # Optimizer must include log_std if present
+        params = list(self.policy.parameters()) + list(self.value_net.parameters())
+        if self.log_std is not None:
+            params.append(self.log_std)
+        self.optim = optim.Adam(params, lr=lr)
 
     # --------------- utilities -----------------
-    def _act(self, obs: torch.Tensor):
-        logits = self.policy(obs)
-        dist = torch.distributions.Categorical(logits=logits)
-        action = dist.sample()
-        action_np = action.detach().cpu().numpy()
-        logp = dist.log_prob(action)
-        if self.action_continuous and action_np.shape == ():  # scalar case
-            action_np = np.array([action_np])  # wrap in 1D array
+    def _flatten_obs(self, obs) -> torch.Tensor:
+        """
+        Convert an observation (np array or tensor) to a flat float32 tensor on self.device.
+        """
+        if isinstance(obs, np.ndarray):
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         else:
-            action_np = action_np.item()
+            obs_t = obs.to(self.device, dtype=torch.float32)
+        return obs_t.view(-1)  # flatten to [obs_dim]
 
-        return action_np, logp, dist.entropy(), logits
+    def _act(self, obs: torch.Tensor):
+        """
+        Given a single *flat* observation tensor of shape [obs_dim],
+        sample an action and return (action_np, logp, entropy, raw_output).
+        """
+        if self.action_continuous:
+            # Continuous: Gaussian policy
+            mu = self.policy(obs)                     # [act_dim]
+            std = self.log_std.exp().expand_as(mu)    # [act_dim]
+            dist = torch.distributions.Normal(mu, std)
+
+            raw_action = dist.sample()                # [act_dim]
+            # (Simple version) clamp to bounds for env step
+            action = raw_action
+            if self.act_low is not None and self.act_high is not None:
+                action = torch.max(torch.min(action, self.act_high), self.act_low)
+
+            logp = dist.log_prob(raw_action).sum(-1)  # scalar
+            entropy = dist.entropy().sum(-1)          # scalar
+
+            action_np = action.detach().cpu().numpy().astype(np.float32)
+            return action_np, logp, entropy, mu
+
+        else:
+            # Discrete: Categorical policy
+            logits = self.policy(obs)                 # [act_dim]
+            dist = torch.distributions.Categorical(logits=logits)
+            action = dist.sample()                    # scalar
+            logp = dist.log_prob(action)
+            entropy = dist.entropy()
+
+            action_np = int(action.detach().cpu().item())
+            return action_np, logp, entropy, logits
 
     def _compute_advantages(
         self,
-        rewards: List[float],
-        values: List[float],
-        dones: List[bool],
+        rewards,
+        values,
+        dones,
         last_value: float
     ):
         adv, gae = [], 0.0
@@ -911,12 +981,15 @@ class PPOAgent:
             adv.insert(0, gae)
             last_value = values[t]
         returns = [a + v for a, v in zip(adv, values)]
-        return torch.tensor(adv, device=self.device), torch.tensor(returns, device=self.device)
+        adv = torch.tensor(adv, device=self.device, dtype=torch.float32)
+        returns = torch.tensor(returns, device=self.device, dtype=torch.float32)
+        return adv, returns
 
     # --------------- main public API -----------------
     def train_step(self, env, rollout_steps: int = 2048, mini_epochs: int = 10, mb_size: int = 64):
-        obs = env.reset()[0]  # gymnasium returns (obs, info)
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        # Reset env and flatten observation
+        obs = env.reset()[0]
+        obs_t = self._flatten_obs(obs)
 
         ep_returns = []     # collect episodic returns for logging
         ep_len = ep_ret = 0
@@ -929,7 +1002,9 @@ class PPOAgent:
             with torch.no_grad():
                 value = self.value_net(obs_t).squeeze().item()
                 action, logp, ent, _ = self._act(obs_t)
+
             next_obs, reward, done, trunc, _ = env.step(action)
+
             obs_buf.append(obs_t.cpu())
             act_buf.append(action)
             logp_buf.append(logp.cpu())
@@ -945,28 +1020,34 @@ class PPOAgent:
                 next_obs, _ = env.reset()
                 ep_returns.append(ep_ret)
                 ep_len = ep_ret = 0
-                next_obs, _ = env.reset()
-            obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
+
+            obs_t = self._flatten_obs(next_obs)
 
         # ---------- advantages ----------
         with torch.no_grad():
             last_val = self.value_net(obs_t).squeeze().item()
         adv, ret = self._compute_advantages(rew_buf, val_buf, done_buf, last_val)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)  # normalise
-        adv = torch.tensor(adv, device=self.device)
-        ret = torch.tensor(ret, device=self.device)
 
-        # ---------- optimisation ----------
+        # ---------- prepare tensors ----------
         dataset_size = rollout_steps
         idxs = torch.randperm(dataset_size)
+
         obs_tensor = torch.stack(obs_buf).to(self.device)
-        act_tensor = torch.tensor(act_buf, dtype=torch.long, device=self.device)
+
+        if self.action_continuous:
+            act_tensor = torch.as_tensor(np.array(act_buf), dtype=torch.float32, device=self.device)
+        else:
+            act_tensor = torch.as_tensor(act_buf, dtype=torch.long, device=self.device)
+
         old_logp_tensor = torch.stack(logp_buf).to(self.device)
 
+        # ---------- optimisation ----------
         for _ in range(mini_epochs):
             for start in range(0, dataset_size, mb_size):
                 end = start + mb_size
                 mb_idx = idxs[start:end]
+
                 # Slice minibatch
                 batch_obs = obs_tensor[mb_idx]
                 batch_act = act_tensor[mb_idx]
@@ -975,17 +1056,27 @@ class PPOAgent:
                 batch_old_logp = old_logp_tensor[mb_idx]
 
                 # New logprobs & value
-                logits = self.policy(batch_obs)
-                dist = torch.distributions.Categorical(logits=logits)
-                new_logp = dist.log_prob(batch_act)
-                entropy = dist.entropy().mean()
+                if self.action_continuous:
+                    mu = self.policy(batch_obs)                          # [B, act_dim]
+                    std = self.log_std.exp().expand_as(mu)               # [B, act_dim]
+                    dist = torch.distributions.Normal(mu, std)
+
+                    new_logp = dist.log_prob(batch_act).sum(-1)          # [B]
+                    entropy = dist.entropy().sum(-1).mean()
+                else:
+                    logits = self.policy(batch_obs)
+                    dist = torch.distributions.Categorical(logits=logits)
+                    new_logp = dist.log_prob(batch_act)                  # [B]
+                    entropy = dist.entropy().mean()
+
                 ratio = torch.exp(new_logp - batch_old_logp)
 
                 # Clipped surrogate
                 surr1 = ratio * batch_adv
                 surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * batch_adv
                 actor_loss = -torch.min(surr1, surr2).mean()
-                value_pred = self.value_net(batch_obs).squeeze()
+
+                value_pred = self.value_net(batch_obs).squeeze(-1)
                 critic_loss = (batch_ret - value_pred).pow(2).mean()
 
                 loss = actor_loss + self.vf_coef * critic_loss - self.ent_coef * entropy
@@ -996,42 +1087,32 @@ class PPOAgent:
         mean_ep_return = float(np.mean(ep_returns)) if ep_returns else 0.0
 
         return {
-                    "mean_episode_return": mean_ep_return,
-                    "mean_reward_per_step": np.mean(rew_buf),
-                    "value_loss": critic_loss.item(),
-                    "policy_loss": actor_loss.item(),
-               }  #  for logging
-    
+            "mean_episode_return": mean_ep_return,
+            "mean_reward_per_step": float(np.mean(rew_buf)),
+            "value_loss": critic_loss.item(),
+            "policy_loss": actor_loss.item(),
+        }
+
     def evaluate(
         self,
         env: gym.Env,
         n_episodes: int = 2,
         max_steps_per_episode: int = 200,
-    ) -> List[float]:
+    ):
         """
         Execute the learned policies to evaluate performance.
         This method does not train the model.
-
-        Args:
-            n_episodes (int, optional): Number of episodes to run for evaluation.
-            max_steps_per_episode (int, optional): Maximum steps to run in each episode.
-
-        Returns:
-            List[float]: Total rewards for each of the evaluation episodes.
         """
         rewards = []
         for _ in range(n_episodes):
             obs, _ = env.reset()
-            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+            obs_t = self._flatten_obs(obs)
             episode_reward = 0.0
-            done = False
-            truncated = False
 
             for _ in range(max_steps_per_episode):
-                # Always pick the best action - greedy
-                action = self._act(obs_t)[0] # Obtain only action
+                action = self._act(obs_t)[0]  # Obtain only action
                 next_obs, reward, done, truncated, _ = env.step(action)
-                obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
+                obs_t = self._flatten_obs(next_obs)
 
                 episode_reward += reward
 
@@ -1042,9 +1123,6 @@ class PPOAgent:
 
         env.close()
         return rewards
-
-
-
 
 class COINPPOAgent(PPOAgent):
     """
