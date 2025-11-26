@@ -126,27 +126,28 @@ class CustomPendulumEnv(TimeLimitMixin, PendulumEnv):
 
         if self.screen is None:
             pygame.init()
+            w = int(self.screen_dim)
+            h = int(self.screen_dim)
             if self.render_mode == "human":
                 pygame.display.init()
-                self.screen = pygame.display.set_mode(
-                    (self.screen_dim, self.screen_dim)
-                )
+                self.screen = pygame.display.set_mode((w, h))
             else:  # "rgb_array"
-                self.screen = pygame.Surface((self.screen_dim, self.screen_dim))
+                self.screen = pygame.Surface((w, h))
+
         if self.clock is None:
             self.clock = pygame.time.Clock()
 
-        # ---- drawing surface ----------------------------------------
-        self.surf = pygame.Surface((self.screen_dim, self.screen_dim))
+        self.surf = pygame.Surface(
+            (int(self.screen_dim), int(self.screen_dim))
+        )
         self.surf.fill((255, 255, 255))
 
-        # World-to-pixel conversion
-        bound = 2.2                                   # keep field-of-view fixed
-        scale = self.screen_dim / (bound * 2)         # px per world-unit
-        offset = self.screen_dim // 2                 # screen centre
+        bound = 2.2
+        scale = float(self.screen_dim) / (bound * 2)
+        offset = int(self.screen_dim // 2)
 
-        rod_length = self.l * scale                   # <-- length now respects self.l
-        rod_width  = 0.2 * scale
+        rod_length = float(self.l) * scale
+        rod_width = 0.2 * scale
 
         # Four corners of the rod (before rotation)
         l, r, t, b = 0, rod_length, rod_width / 2, -rod_width / 2
@@ -181,19 +182,19 @@ class CustomPendulumEnv(TimeLimitMixin, PendulumEnv):
             ).joinpath("assets/clockwise.png")
             img = pygame.image.load(str(asset_path))
         except (FileNotFoundError, ModuleNotFoundError, pygame.error):
-            # No asset?  No worries — just omit the arrow.
+            # No asset?  Omit the arrow.
             img = None
 
         if img is not None and self.last_u is not None:
-            arrow_size = int(scale * abs(self.last_u) / 2)
-            # Ensure at least 1 px so pygame doesn't get (0, 0)
+            torque = float(np.array(self.last_u).reshape(-1)[0])
+            arrow_size = int(scale * abs(torque) / 2)
             arrow_size = max(1, arrow_size)
 
             arrow = pygame.transform.smoothscale(
                 img,
-                (arrow_size, arrow_size),
+                (int(arrow_size), int(arrow_size)),
             )
-            arrow = pygame.transform.flip(arrow, self.last_u > 0, True)
+            arrow = pygame.transform.flip(arrow, bool(torque > 0), True)
             self.surf.blit(
                 arrow,
                 (
