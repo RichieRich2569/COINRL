@@ -1370,6 +1370,18 @@ class EmbodiedCOINPPOAgent(PPOAgent):
         mixed_std = torch.sqrt(1.0 / S_bar)                            # [B, act_dim]
 
         return mixed_mu, mixed_std
+    
+    def _all_optimizers(self):
+        """Helper to extract all optimizers (body + contexts)."""
+        opts = []
+        # body optimizer (if you actually want it to learn)
+        if self.body_optim is not None:
+            opts.append(self.body_optim)
+        # each context optimizer
+        for cid, (opt, _, _, _) in self.nets.items():
+            if opt is not None:
+                opts.append(opt)
+        return opts
 
     # ------------------------------------------------------------------
     # Action selection
@@ -1550,10 +1562,17 @@ class EmbodiedCOINPPOAgent(PPOAgent):
                 value_pred = self._mixed_value(batch_obs, batch_ctx_probs)   # [B]
                 critic_loss = (batch_ret - value_pred).pow(2).mean()
 
+                optimizers = self._all_optimizers()
+
+                for opt in optimizers:
+                    opt.zero_grad()
+
                 loss = actor_loss + self.vf_coef * critic_loss - self.ent_coef * entropy
-                self.optim.zero_grad()
                 loss.backward()
-                self.optim.step()
+
+                for opt in optimizers:
+                    opt.step()
+
 
         rew_buf = np.array(storage["rew"])
         mean_ep_return = float(np.mean(ep_returns)) if ep_returns else 0.0
