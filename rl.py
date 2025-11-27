@@ -1622,6 +1622,50 @@ class EmbodiedCOINPPOAgent(PPOAgent):
 
         env.close()
         return rewards
+    
+    def reset_body_from(
+        self,
+        src_policy: nn.Module,
+        src_value_net: nn.Module,
+        src_log_std: Optional[nn.Parameter] = None,
+    ) -> None:
+        """
+        Reset the body policy / value networks (and optional log_std) to copies of
+        the given source networks.
+
+        Parameters
+        ----------
+        src_policy : nn.Module
+            Source policy network to copy into `self.body_policy`.
+        src_value_net : nn.Module
+            Source value network to copy into `self.body_value_net`.
+        src_log_std : Optional[nn.Parameter], default=None
+            Source log-std parameter to copy into `self.body_log_std` (for
+            continuous actions). If None and `self.action_continuous` is True,
+            the body log-std is reset to zeros.
+        """
+
+        # Copy weights into body networks
+        self.body_policy.load_state_dict(src_policy.state_dict())
+        self.body_value_net.load_state_dict(src_value_net.state_dict())
+
+        # Handle log-std for continuous actions
+        if self.action_continuous:
+            if src_log_std is not None:
+                with torch.no_grad():
+                    self.body_log_std.copy_(src_log_std.data.to(self.body_log_std.device))
+            else:
+                # If no source log_std provided, reset to zeros
+                with torch.no_grad():
+                    self.body_log_std.zero_()
+
+        # Rebuild body optimizer so it tracks the (possibly new) Parameter objects
+        body_params = list(self.body_policy.parameters()) + list(self.body_value_net.parameters())
+        if self.body_log_std is not None:
+            body_params.append(self.body_log_std)
+
+        self.body_optim = optim.Adam(body_params, lr=self.body_lr)
+
 
 
 class COINPPOAgent(PPOAgent):
