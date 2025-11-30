@@ -909,16 +909,14 @@ class PPOAgent:
         self.policy = _MLP(self.obs_dim, self.act_dim).to(device)
         self.value_net = _MLP(self.obs_dim, 1).to(device)
 
-        # For continuous actions, keep a learnable log_std
+        # For continuous actions, keep a fixed log_std
         if self.action_continuous:
-            self.log_std = nn.Parameter(torch.ones(self.act_dim, device=device) * -0.5)
+            self.log_std = torch.ones(self.act_dim, device=device) * np.log(0.5)
         else:
             self.log_std = None
 
-        # Optimizer must include log_std if present
+        # Optimizer
         params = list(self.policy.parameters()) + list(self.value_net.parameters())
-        if self.log_std is not None:
-            params.append(self.log_std)
         self.optim = optim.Adam(params, lr=lr)
 
     # --------------- utilities -----------------
@@ -1176,13 +1174,12 @@ class EmbodiedCOINPPOAgent(PPOAgent):
         self.body_value_net = _MLP(self.obs_dim, 1).to(self.device)
 
         if self.action_continuous:
-            self.body_log_std = nn.Parameter(torch.zeros(self.act_dim, device=self.device))
+            # Fixed log_std - no learning for simplicity
+            self.body_log_std = torch.ones(self.act_dim, device=self.device) * np.log(0.5)
         else:
             self.body_log_std = None
 
         body_params = list(self.body_policy.parameters()) + list(self.body_value_net.parameters())
-        if self.body_log_std is not None:
-            body_params.append(self.body_log_std)
         self.body_optim = optim.Adam(body_params, lr=self.body_lr)
 
         # self.nets holds per-context networks (including 'novel')
@@ -1193,13 +1190,12 @@ class EmbodiedCOINPPOAgent(PPOAgent):
         policy = _MLP(self.obs_dim, self.act_dim).to(self.device)
         value_net = _MLP(self.obs_dim, 1).to(self.device)
         if self.action_continuous:
-            log_std = nn.Parameter(torch.zeros(self.act_dim, device=self.device))
+            # Fixed log_std - no learning for simplicity
+            log_std = torch.ones(self.act_dim, device=self.device) * np.log(0.5)
         else:
             log_std = None
 
         params = list(policy.parameters()) + list(value_net.parameters())
-        if log_std is not None:
-            params.append(log_std)
         opt = optim.Adam(params, lr=self.lr)
         self.nets["novel"] = (opt, policy, value_net, log_std)
 
@@ -1217,8 +1213,6 @@ class EmbodiedCOINPPOAgent(PPOAgent):
         log_std = copy.deepcopy(log_std_novel).to(self.device) if log_std_novel is not None else None
 
         params = list(policy.parameters()) + list(value_net.parameters())
-        if log_std is not None:
-            params.append(log_std)
         opt = optim.Adam(params, lr=self.lr)
         self.nets[new_cid] = (opt, policy, value_net, log_std)
         self.context_init[new_cid] = 1
@@ -1425,7 +1419,7 @@ class EmbodiedCOINPPOAgent(PPOAgent):
             if self.act_low is not None and self.act_high is not None:
                 action = torch.max(torch.min(action, self.act_high), self.act_low)
 
-            logp = dist.log_prob(raw_action).sum(-1)   # [B]
+            logp = dist.log_prob(action).sum(-1)   # [B]
             entropy = dist.entropy().sum(-1)          # [B]
 
             # Assuming we call this with B=1 during rollout
