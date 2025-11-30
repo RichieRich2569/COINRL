@@ -911,7 +911,7 @@ class PPOAgent:
 
         # For continuous actions, keep a learnable log_std
         if self.action_continuous:
-            self.log_std = nn.Parameter(torch.zeros(self.act_dim, device=device))
+            self.log_std = nn.Parameter(torch.ones(self.act_dim, device=device) * -0.5)
         else:
             self.log_std = None
 
@@ -949,7 +949,7 @@ class PPOAgent:
             if self.act_low is not None and self.act_high is not None:
                 action = torch.max(torch.min(action, self.act_high), self.act_low)
 
-            logp = dist.log_prob(raw_action).sum(-1)  # scalar
+            logp = dist.log_prob(action).sum(-1)  # scalar
             entropy = dist.entropy().sum(-1)          # scalar
 
             action_np = action.detach().cpu().numpy().astype(np.float32)
@@ -966,24 +966,29 @@ class PPOAgent:
             action_np = int(action.detach().cpu().item())
             return action_np, logp, entropy, logits
 
-    def _compute_advantages(
-        self,
-        rewards,
-        values,
-        dones,
-        last_value: float
-    ):
-        adv, gae = [], 0.0
-        # GAE backwards
+    def _compute_advantages(self, rewards, values, dones, last_value: float):
+        # Make 'values' a simple Python list of floats
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().numpy().tolist()
+        else:
+            values = list(values)
+
+        # Append bootstrap value as V_{T}
+        values = values + [last_value]
+
+        adv = []
+        gae = 0.0
         for t in reversed(range(len(rewards))):
-            delta = rewards[t] + self.gamma * (1 - dones[t]) * last_value - values[t]
+            next_value = values[t + 1]
+            delta = rewards[t] + self.gamma * (1 - dones[t]) * next_value - values[t]
             gae = delta + self.gamma * self.lam * (1 - dones[t]) * gae
             adv.insert(0, gae)
-            last_value = values[t]
-        returns = [a + v for a, v in zip(adv, values)]
+
+        returns = [a + v for a, v in zip(adv, values[:-1])]
         adv = torch.tensor(adv, device=self.device, dtype=torch.float32)
         returns = torch.tensor(returns, device=self.device, dtype=torch.float32)
         return adv, returns
+
 
     # --------------- main public API -----------------
     def train_step(self, env, rollout_steps: int = 2048, mini_epochs: int = 10, mb_size: int = 64):
@@ -1082,7 +1087,14 @@ class PPOAgent:
                 loss = actor_loss + self.vf_coef * critic_loss - self.ent_coef * entropy
                 self.optim.zero_grad()
                 loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_([self.log_std], 0.5)
                 self.optim.step()
+
+                with torch.no_grad():
+                    self.log_std.clamp_(-4.0, 1.0)
 
         mean_ep_return = float(np.mean(ep_returns)) if ep_returns else 0.0
 
