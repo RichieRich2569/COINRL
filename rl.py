@@ -1085,14 +1085,7 @@ class PPOAgent:
                 loss = actor_loss + self.vf_coef * critic_loss - self.ent_coef * entropy
                 self.optim.zero_grad()
                 loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-                torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 0.5)
-                torch.nn.utils.clip_grad_norm_([self.log_std], 0.5)
                 self.optim.step()
-
-                with torch.no_grad():
-                    self.log_std.clamp_(-4.0, 1.0)
 
         mean_ep_return = float(np.mean(ep_returns)) if ep_returns else 0.0
 
