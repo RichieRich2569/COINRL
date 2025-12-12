@@ -165,9 +165,10 @@ class COIN:
             "context",
             "motor_output",
             "predicted_probabilities",
+            "stationary_probabilities",
             "C",
             "state_mean",
-            "state_var"
+            "state_var",
         ], 
         # evaluation
         retention_values: Optional[np.ndarray] = None, 
@@ -962,12 +963,12 @@ class COIN:
         
         # compute stationary context probabilities if necessary
         if ("stationary_probabilities" in self.store) and (coin_state["trial"] > 0):
-            coin_state["stationary_probabilities"] = np.zeros((self.max_contexts+1, self.particles))
+            coin_state["stationary_probabilities"] = np.zeros((self.max_contexts, self.particles))
             
             for p in range(self.particles):
                 C = coin_state["C"][p]
-                transmat = coin_state["local_transition_matrix"][:(C+1), :(C+1), p]
-                coin_state["stationary_probabilities"][:(C+1), p] = stationary_distribution(transmat)
+                transmat = coin_state["local_transition_matrix"][:C, :C, p]
+                coin_state["stationary_probabilities"][:C, p] = stationary_distribution(transmat)
         
         return coin_state
     
@@ -1812,6 +1813,12 @@ class COIN:
         P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
         P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
         return P["predicted_probabilities"]
+    
+    def get_stationary_probabilities(self, S: Dict[str, Any]):
+        self.plot_stationary_probabilities = True # Set to true but we will not be plotting - shortcut to avoid editing existing code
+        P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
+        P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
+        return P["stationary_probabilities"]
     
     def get_predicted_responsibilities(self, S: Dict[str, Any], y: np.ndarray):
         # Obtain responsibilities given different state feedback values from a starting predicted probability

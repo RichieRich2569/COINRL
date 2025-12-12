@@ -7,3 +7,6 @@ __pycache__/
 
 # Ignore vscode settings
 .vscode/
+
+# Ignore some python code
+test.py

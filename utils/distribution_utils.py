@@ -86,24 +86,19 @@ def random_dirichlet(R: np.ndarray):
     gamma_samples = random_gamma_ND(R)
     return gamma_samples / np.sum(gamma_samples, axis=0, keepdims=True)
 
-
 def stationary_distribution(transmat: np.ndarray):
-    # statioanry distribution of a time-homogeneous Markov process
-    
-    c = transmat.shape[0] # number of contexts
-    
-    A = transmat.T - np.eye(c)
-    b = np.zeros((c, ))
-    
-    A = np.concatenate([A, np.ones((1, c))], axis=0)
-    b = np.concatenate([b, np.array([1.])], axis=0)
-    
-    x = np.linalg.solve(A, b)
-    
-    x[x < 0] = 0
-    p = x / np.sum(x)
+    # stationary distribution of a time-homogeneous Markov process
 
-    return p
+    c = transmat.shape[0] # number of contexts
+
+    A = transmat.T - np.eye(c)
+    A[-1, :] = 1.0              # replace one equation with normalization
+    b = np.zeros(c)
+    b[-1] = 1.0
+
+    x = np.linalg.solve(A, b)
+    x = np.maximum(x, 0.0)
+    return x / x.sum()
 
 
 def random_truncated_bivariate_normal(mu: np.ndarray, cov: np.ndarray):
