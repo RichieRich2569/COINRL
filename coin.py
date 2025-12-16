@@ -169,6 +169,8 @@ class COIN:
             "C",
             "state_mean",
             "state_var",
+            "dynamics_mean",
+            "dynamics_covariance",
         ], 
         # evaluation
         retention_values: Optional[np.ndarray] = None, 
@@ -967,8 +969,8 @@ class COIN:
             
             for p in range(self.particles):
                 C = coin_state["C"][p]
-                transmat = coin_state["local_transition_matrix"][:C, :C, p]
-                coin_state["stationary_probabilities"][:C, p] = stationary_distribution(transmat)
+                transmat = coin_state["local_transition_matrix"][:C+1, :C+1, p]
+                coin_state["stationary_probabilities"][:C+1, p] = stationary_distribution(transmat)
         
         return coin_state
     
@@ -1128,9 +1130,9 @@ class COIN:
         if self.plot_stationary_probabilities:
             temp.append("stationary_probabilities")
         if self.plot_retention_given_context:
-            temp.extend(["dynamics_mean", "dynamics_covar"])
+            temp.extend(["dynamics_mean", "dynamics_covariance"])
         if self.plot_drift_given_context:
-            temp.extend(["dynamics_mean", "dynamics_covar"])
+            temp.extend(["dynamics_mean", "dynamics_covariance"])
         if self.plot_bias_given_context:
             if self.infer_bias:
                 temp.extend(["bias_mean", "bias_var"])
@@ -1563,7 +1565,7 @@ class COIN:
             S["runs"][run]["stationary_probabilities"][optimal_assignment, particle, trial] = S["runs"][run]["stationary_probabilities"][:C, particle, trial]
         if self.plot_retention_given_context or self.plot_drift_given_context:
             S["runs"][run]["dynamics_mean"][:, optimal_assignment, particle, trial] = S["runs"][run]["dynamics_mean"][:, :C, particle, trial]
-            S["runs"][run]["dynamics_var"][:, optimal_assignment, particle, trial] = S["runs"][run]["dynamics_var"][:, :C, particle, trial]
+            S["runs"][run]["dynamics_covariance"][:, :, optimal_assignment, particle, trial] = S["runs"][run]["dynamics_covariance"][:, :, :C, particle, trial]
         if self.plot_bias_given_context:
             S["runs"][run]["bias_mean"][optimal_assignment, particle, trial] = S["runs"][run]["bias_mean"][:C, particle, trial]
             S["runs"][run]["bias_var"][optimal_assignment, particle, trial] = S["runs"][run]["bias_var"][:C, particle, trial]
@@ -1571,7 +1573,7 @@ class COIN:
             S["runs"][run]["global_transition_posterior"][optimal_assignment, particle, trial] = S["runs"][run]["global_transition_posterior"][:C, particle, trial]
         if self.plot_local_transition_probabilities:
             S["runs"][run]["local_transition_matrix"][:C, :(C+1), particle, trial] = \
-                self.permute_transition_matrix_columns_and_rows(S["runs"][run]["local_transition_matrix"][:C, particle, trial], optimal_assignment)
+                self.permute_transition_matrix_columns_and_rows(S["runs"][run]["local_transition_matrix"][:C,:(C+1), particle, trial], optimal_assignment)
         if self.plot_local_cue_probabilities:
             S["runs"][run]["local_cue_matrix"][optimal_assignment, :, particle, trial] = S["runs"][run]["local_cue_matrix"][:C, :, particle, trial]
         
@@ -1624,18 +1626,25 @@ class COIN:
             P["stationary_probabilities"][trial, np.concatenate([np.arange(C), np.array([novel_context])]), run] = \
                 np.sum(S["runs"][run]["stationary_probabilities"][:(C+1), particles, trial], axis=1)
         if self.plot_retention_given_context:
-            # TODO: verify the dimensions!
-            mu = np.transpose(S["runs"][run]["dynamics_mean"][0, :C, particles, trial], [1, 0])
-            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][0, 0, :C, particles, trial]), [1, 0])
-            P["retention_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.retention_values), axis=1)
+            mean_CP = S["runs"][run]["dynamics_mean"][0, :C, :, trial]                  # (C, P)
+            cov_CP  = S["runs"][run]["dynamics_covariance"][0, 0, :C, :, trial]         # (C, P)
+            mu  = mean_CP[:, particles].T[None, :, :]                                   # (1, P′, C)
+            std = np.sqrt(cov_CP[:, particles]).T[None, :, :]                           # (1, P′, C)
+            x = self.retention_values[:, None, None]                                    # (D, 1, 1)
+            pdf = norm.pdf(x, loc=mu, scale=std)                                        # (D, P′, C)
+            P["retention_given_context"][:, trial, :C, run] = pdf.sum(axis=1)  
         if self.plot_drift_given_context:
-            mu = np.transpose(S["runs"][run]["dynamics_mean"][1, :C, particles, trial], [1, 0])
-            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][1, 1, :C, particles, trial]), [1, 0])
-            P["drift_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.drift_values), axis=1)
+            mean_CP = S["runs"][run]["dynamics_mean"][1, :C, :, trial]                  # (C, P)
+            cov_CP  = S["runs"][run]["dynamics_covariance"][1, 1, :C, :, trial]         # (C, P)
+            mu  = mean_CP[:, particles].T[None, :, :]                                   # (1, P′, C)
+            std = np.sqrt(cov_CP[:, particles]).T[None, :, :]                           # (1, P′, C)
+            x = self.drift_values[:, None, None]                                    # (D, 1, 1)
+            pdf = norm.pdf(x, loc=mu, scale=std)                                        # (D, P′, C)
+            P["drift_given_context"][:, trial, :C, run] = pdf.sum(axis=1)  
         if self.plot_bias_given_context:
             mu = np.transpose(S["runs"][run]["bias_mean"][:C, particles, trial], [1, 0])
             std = np.transpose(np.sqrt(S["runs"][run]["bias_var"][:C, particles, trial]), [1, 0])
-            P["bias_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.bias_values), axis=1)
+            P["bias_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.bias_values.reshape(-1,1)), axis=1).reshape(-1,1)
         if self.plot_global_transition_probabilities:
             alpha = S["runs"][run]["global_transition_posterior"][:(C+1), particles, trial]
             P["global_transition_probabilities"][trial, np.concatenate([np.arange(C), np.array([novel_context])]), run] = \
@@ -1779,9 +1788,9 @@ class COIN:
         if self.plot_stationary_probabilities:
             P["stationary_probabilities"] = P["stationary_probabilities"] / Z[None]
         if self.plot_retention_given_context:
-            P["retention_given_context"] = P["retention_given_context"] / Z[:, None]
+            P["retention_given_context"] = P["retention_given_context"] / Z[None, :]
         if self.plot_drift_given_context:
-            P["drift_given_context"] = P["drift_given_context"] / Z[:, None]
+            P["drift_given_context"] = P["drift_given_context"] / Z[None, :]
         if self.plot_bias_given_context:
             P["bias_given_context"] = P["bias_given_context"] / Z[:, None]
         if self.plot_global_transition_probabilities:
@@ -1819,6 +1828,19 @@ class COIN:
         P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
         P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
         return P["stationary_probabilities"]
+    
+    def get_retention_and_drift_given_context(self, S: Dict[str, Any], retention_vals : np.ndarray = None, drift_vals: np.ndarray = None):
+        if retention_vals is None and drift_vals is None:
+            raise ValueError("Either retention_vals or drift_vals must be provided.")
+        if retention_vals is not None:
+            self.retention_values = retention_vals
+            self.plot_retention_given_context = True # Set to true but we will not be plotting - shortcut to avoid editing existing code
+        if drift_vals is not None:
+            self.drift_values = drift_vals
+            self.plot_drift_given_context = True # Set to true but we will not be plotting - shortcut to avoid editing existing code
+        P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
+        P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)   
+        return P.get("retention_given_context", None), P.get("drift_given_context", None)
     
     def get_predicted_responsibilities(self, S: Dict[str, Any], y: np.ndarray):
         # Obtain responsibilities given different state feedback values from a starting predicted probability
