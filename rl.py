@@ -919,6 +919,20 @@ class PPOAgent:
         params = list(self.policy.parameters()) + list(self.value_net.parameters())
         self.optim = optim.Adam(params, lr=lr)
 
+        # --- evaluation shadow (CPU) ---
+        self._eval_policy_cpu = None
+        self._eval_value_cpu = None
+        self._weights_version = 0
+        self._eval_sync_version = -1
+
+        # keep numpy bounds for fast clipping on CPU
+        if self.action_continuous:
+            self.act_low_np = act_space.low.astype(np.float32)
+            self.act_high_np = act_space.high.astype(np.float32)
+        else:
+            self.act_low_np = None
+            self.act_high_np = None
+
     # --------------- utilities -----------------
     def _flatten_obs(self, obs) -> torch.Tensor:
         """
@@ -1089,43 +1103,88 @@ class PPOAgent:
 
         mean_ep_return = float(np.mean(ep_returns)) if ep_returns else 0.0
 
+        self._weights_version += 1
+
         return {
             "mean_episode_return": mean_ep_return,
             "mean_reward_per_step": float(np.mean(rew_buf)),
             "value_loss": critic_loss.item(),
             "policy_loss": actor_loss.item(),
         }
+    
+    def _get_eval_nets_cpu(self):
+        if self._eval_policy_cpu is None:
+            self._eval_policy_cpu = _MLP(self.obs_dim, self.act_dim).cpu()
+            self._eval_value_cpu = _MLP(self.obs_dim, 1).cpu()
+
+        if self._eval_sync_version != self._weights_version:
+            # one-time copy from current device to CPU
+            self._eval_policy_cpu.load_state_dict(self.policy.state_dict())
+            self._eval_value_cpu.load_state_dict(self.value_net.state_dict())
+            self._eval_sync_version = self._weights_version
+
+        return self._eval_policy_cpu, self._eval_value_cpu
+
 
     def evaluate(
         self,
         env: gym.Env,
         n_episodes: int = 2,
         max_steps_per_episode: int = 200,
+        deterministic: bool = True,
+        eval_on_cpu: bool = True,
     ):
-        """
-        Execute the learned policies to evaluate performance.
-        This method does not train the model.
-        """
         rewards = []
-        for _ in range(n_episodes):
-            obs, _ = env.reset()
-            obs_t = self._flatten_obs(obs)
-            episode_reward = 0.0
 
-            for _ in range(max_steps_per_episode):
-                action = self._act(obs_t)[0]  # Obtain only action
-                next_obs, reward, done, truncated, _ = env.step(action)
-                obs_t = self._flatten_obs(next_obs)
+        if eval_on_cpu and str(self.device).startswith("cuda"):
+            policy_net, _ = self._get_eval_nets_cpu()
+            device = "cpu"
+        else:
+            policy_net = self.policy
+            device = self.device
 
-                episode_reward += reward
+        policy_net.eval()
 
-                if done or truncated:
-                    break
+        with torch.inference_mode():
+            for _ in range(n_episodes):
+                obs = env.reset()[0]
+                ep_ret = 0.0
 
-            rewards.append(episode_reward)
+                for _ in range(max_steps_per_episode):
+                    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).view(-1)
 
-        env.close()
+                    if self.action_continuous:
+                        mu = policy_net(obs_t)
+                        if deterministic:
+                            a = mu
+                        else:
+                            std = self.log_std.exp().expand_as(mu) if device != "cpu" else torch.exp(
+                                torch.as_tensor(self.log_std.detach().cpu())
+                            ).expand_as(mu)
+                            a = torch.distributions.Normal(mu, std).sample()
+
+                        if device == "cpu":
+                            action = a.numpy().astype(np.float32)
+                            action = np.clip(action, self.act_low_np, self.act_high_np)
+                        else:
+                            action = a.detach().cpu().numpy().astype(np.float32)
+                            action = np.clip(action, self.act_low_np, self.act_high_np)
+
+                    else:
+                        logits = policy_net(obs_t)
+                        action = int(torch.argmax(logits).item()) if deterministic else int(
+                            torch.distributions.Categorical(logits=logits).sample().item()
+                        )
+
+                    obs, reward, done, trunc, _ = env.step(action)
+                    ep_ret += float(reward)
+                    if done or trunc:
+                        break
+
+                rewards.append(ep_ret)
+
         return rewards
+
     
 class EmbodiedCOINPPOAgent(PPOAgent):
     """
