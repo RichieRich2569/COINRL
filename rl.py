@@ -1251,6 +1251,12 @@ class EmbodiedCOINPPOAgent(PPOAgent):
         opt = optim.Adam(params, lr=self.lr)
         self.nets["novel"] = (opt, policy, value_net, log_std)
 
+        # Evaluation shadows (CPU)
+        self._eval_body_policy_cpu = None
+        self._eval_body_value_cpu = None
+        self._eval_context_policies_cpu: Dict[Any, nn.Module] = {}
+        self._eval_context_values_cpu: Dict[Any, nn.Module] = {}
+
     # ------------------------------------------------------------------
     # Context instantiation
     # ------------------------------------------------------------------
@@ -1635,6 +1641,8 @@ class EmbodiedCOINPPOAgent(PPOAgent):
         rew_buf = np.array(storage["rew"])
         mean_ep_return = float(np.mean(ep_returns)) if ep_returns else 0.0
 
+        self._weights_version += 1
+
         return {
             "mean_episode_return": mean_ep_return,
             "mean_reward_per_step": float(rew_buf.mean()) if len(rew_buf) > 0 else 0.0,
@@ -1642,12 +1650,41 @@ class EmbodiedCOINPPOAgent(PPOAgent):
             "policy_loss": actor_loss.item(),
         }
     
+    def _get_eval_nets_cpu(self):
+        if self._eval_body_policy_cpu is None:
+            self._eval_body_policy_cpu = _MLP(self.obs_dim, self.act_dim).cpu()
+            self._eval_body_value_cpu = _MLP(self.obs_dim, 1).cpu()
+
+        # Check all context nets too
+        for cid in self.context_keys:
+            if self.context_init.get(cid, 0) == 0:
+                continue
+            if cid not in self._eval_context_policies_cpu:
+                self._eval_context_policies_cpu[cid] = _MLP(self.obs_dim, self.act_dim).cpu()
+                self._eval_context_values_cpu[cid] = _MLP(self.obs_dim, 1).cpu()
+
+        if self._eval_sync_version != self._weights_version:
+            # one-time copy from current device to CPU
+            self._eval_body_policy_cpu.load_state_dict(self.body_policy.state_dict())
+            self._eval_body_value_cpu.load_state_dict(self.body_value_net.state_dict())
+            for cid in self.context_keys:
+                if self.context_init.get(cid, 0) == 0:
+                    continue
+                _, policy, value_net, _ = self.nets[cid]
+                self._eval_context_policies_cpu[cid].load_state_dict(policy.state_dict())
+                self._eval_context_values_cpu[cid].load_state_dict(value_net.state_dict())
+            self._eval_sync_version = self._weights_version
+
+        return self._eval_body_policy_cpu, self._eval_body_value_cpu, self._eval_context_policies_cpu, self._eval_context_values_cpu
+    
     def evaluate(
         self,
         env: gym.Env,
         context_probs_fn,
         n_episodes: int = 2,
         max_steps_per_episode: int = 200,
+        deterministic: bool = True,
+        eval_on_cpu: bool = True,
     ):
         """
         Execute the learned policies to evaluate performance.
@@ -1658,27 +1695,85 @@ class EmbodiedCOINPPOAgent(PPOAgent):
                           where index j corresponds to self.context_keys[j].
         """
         rewards = []
-        for ep_num in range(n_episodes):
-            obs, _ = env.reset()
-            obs_t = self._flatten_obs(obs)
-            episode_reward = 0.0
 
-            for _ in range(max_steps_per_episode):
-                ctx_probs_vec = np.asarray(context_probs_fn(ep_num), dtype=np.float32)  # [N]
-                ctx_probs_t = torch.as_tensor(ctx_probs_vec, device=self.device, dtype=torch.float32)
+        if eval_on_cpu and str(self.device).startswith("cuda"):
+            body_policy_cpu, _, context_policies_cpu, _ = self._get_eval_nets_cpu()
+            device = "cpu"
+        else:
+            body_policy_cpu = self.body_policy
+            context_policies_cpu = {cid: self.nets[cid][1] for cid in self.context_keys if self.context_init.get(cid, 0) == 1}
+            device = self.device
 
-                action = self.act(obs_t, ctx_probs_t)[0]
-                next_obs, reward, done, truncated, _ = env.step(action)
-                obs_t = self._flatten_obs(next_obs)
+        body_policy_cpu.eval()
+        for cid in context_policies_cpu:
+            context_policies_cpu[cid].eval()
 
-                episode_reward += reward
+        with torch.inference_mode():
+            for epnum in range(n_episodes):
+                obs = env.reset()[0]
+                ep_ret = 0.0
 
-                if done or truncated:
-                    break
+                ctx_probs_vec = np.asarray(context_probs_fn(epnum), dtype=np.float32)  # [N]
 
-            rewards.append(episode_reward)
+                # All given contexts must be initialised
+                for j, cid in enumerate(self.context_keys):
+                    p_c = ctx_probs_vec[j]
+                    if p_c != 0.0 and self.context_init.get(cid, 0) == 0:
+                        raise RuntimeError(f"Context ID {cid} required by context_probs_fn but not initialised.")
 
-        env.close()
+                ctx_probs = torch.as_tensor(ctx_probs_vec, device=device, dtype=torch.float32).unsqueeze(0)  # [1, N]
+
+                for _ in range(max_steps_per_episode):
+                    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).view(-1)
+                    B = obs_t.shape[0]
+
+                    # Mixed Means/Logits
+                    mus = [context_policies_cpu[cid](obs_t) for cid in context_policies_cpu]
+                    mus.append(body_policy_cpu(obs_t))
+                    mus = torch.stack(mus, dim=0)
+
+                    # Context Weights
+                    weights = [ctx_probs[:, j].view(B, 1) for j, cid in enumerate(self.context_keys) if cid in context_policies_cpu]
+                    weights.append(torch.ones(B, 1, device=device))
+                    weights = torch.stack(weights, dim=0)
+                    weight_sum = weights.sum(dim=0, keepdim=True).clamp_min(1e-8)
+                    alphas = weights / weight_sum
+
+                    if self.action_continuous:
+                        stds = [torch.exp(torch.as_tensor(self.nets[cid][3].detach().cpu())).view(1, -1).expand_as(mus[0]) for cid in context_policies_cpu]
+                        stds.append(self.body_log_std.exp().view(1, -1).expand_as(mus[0]))
+
+                        stds = torch.stack(stds, dim=0)
+                        precisions = 1.0 / (stds ** 2)
+                        S_bar = (alphas * precisions).sum(dim=0)
+                        num = (alphas * precisions * mus).sum(dim=0)
+                        mixed_mu = num / S_bar
+                        mixed_std = torch.sqrt(1.0 / S_bar)
+                        if deterministic:
+                            a = mixed_mu
+                        else:
+                            a = torch.distributions.Normal(mixed_mu, mixed_std).sample()
+
+                        if device == "cpu":
+                            action = a.numpy().astype(np.float32)
+                            action = np.clip(action, self.act_low_np, self.act_high_np)
+                        else:
+                            action = a.detach().cpu().numpy().astype(np.float32)
+                            action = np.clip(action, self.act_low_np, self.act_high_np)
+
+                    else:
+                        mixed_logits = (alphas * mus).sum(dim=0)  # [1, act_dim]
+                        action = int(torch.argmax(mixed_logits).item()) if deterministic else int(
+                            torch.distributions.Categorical(logits=mixed_logits).sample().item()
+                        )
+
+                    obs, reward, done, trunc, _ = env.step(action)
+                    ep_ret += float(reward)
+                    if done or trunc:
+                        break
+
+                rewards.append(ep_ret)
+
         return rewards
     
     def reset_body_from(
