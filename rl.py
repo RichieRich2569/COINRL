@@ -1733,11 +1733,10 @@ class EmbodiedCOINPPOAgent(PPOAgent):
                     mus = torch.stack(mus, dim=0)
 
                     # Context Weights
-                    weights = [ctx_probs[:, j].view(B, 1) for j, cid in enumerate(self.context_keys) if cid in context_policies_cpu]
-                    weights.append(torch.ones(B, 1, device=device))
-                    weights = torch.stack(weights, dim=0)
-                    weight_sum = weights.sum(dim=0, keepdim=True).clamp_min(1e-8)
-                    alphas = weights / weight_sum
+                    weight_sum = ctx_probs.nansum(dim=1, keepdim=True).clamp_min(1e-8)
+                    alphas = (ctx_probs / weight_sum).view(-1, 1)
+                    # Add 1 to the dimension of alphas for the body
+                    alphas = torch.cat([alphas, torch.ones(1, 1, device=device)], dim=0)
 
                     if self.action_continuous:
                         stds = [torch.exp(torch.as_tensor(self.nets[cid][3].detach().cpu())).view(1, -1).expand_as(mus[0]) for cid in context_policies_cpu]
