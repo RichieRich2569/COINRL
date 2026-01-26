@@ -296,8 +296,9 @@ class CustomMountainCarEnv(TimeLimitMixin, MountainCarEnv):
         self.goal_position = goal_position
     
     def _height(self, xs):
-        # Override the height function to use a sine wave with scaled amplitude
-        return np.sin(3 * xs) * 0.45 * self.amplitude + 0.1 + self.amplitude * 0.45
+        A = float(self.amplitude)
+        return 0.45 * A * np.sin(3 * xs) + 0.1 + 0.45 * abs(A)
+
     
     def render(self):
         if self.render_mode is None:
@@ -331,8 +332,8 @@ class CustomMountainCarEnv(TimeLimitMixin, MountainCarEnv):
 
         world_width = self.max_position - self.min_position
         scale = self.screen_width / world_width
-        if self.amplitude > 1:
-            scale /= self.amplitude
+        if abs(self.amplitude) > 1:
+            scale /= abs(self.amplitude)
         carwidth = 40
         carheight = 20
 
