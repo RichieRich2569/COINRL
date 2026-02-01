@@ -1828,12 +1828,12 @@ class COINPPOAgent(PPOAgent):
     takes in a vector of observations s. For simplicity here, we split COIN from the model, and allow them to 
     connect via s being the episode number of the current epoch.
     """
-    def __init__(self, base_obs_dim: int, act_dim: int, ctx_ids: dict, action_continuous: bool = False, **kwargs):
-        super().__init__(base_obs_dim, act_dim, **kwargs)  # create *dummy* nets
+    def __init__(self, env, ctx_ids: dict, action_continuous: bool = False, **kwargs):
+        super().__init__(env, **kwargs)  # create *dummy* nets
         # override: keep dicts of networks
         self.context_nets: Dict[int, Tuple[nn.Module, nn.Module, optim.Optimizer]] = {}
-        self.act_dim = act_dim
-        self.base_obs_dim = base_obs_dim
+        self.act_dim = env.action_space.shape[0] if action_continuous else env.action_space.n
+        self.base_obs_dim = env.observation_space.shape[0]
         self.lr = kwargs.get("lr", 3e-4)
 
         self.action_continuous = action_continuous
@@ -1845,8 +1845,8 @@ class COINPPOAgent(PPOAgent):
         self.context_init["novel"] = 1  # always have a 'novel' context
         
         # Create initial 'novel' context networks
-        policy = _MLP(base_obs_dim, act_dim).to(self.device)
-        value_net = _MLP(base_obs_dim, 1).to(self.device)
+        policy = _MLP(self.base_obs_dim, self.act_dim).to(self.device)
+        value_net = _MLP(self.base_obs_dim, 1).to(self.device)
         opt = optim.Adam(
             list(policy.parameters()) + list(value_net.parameters()),
             lr=self.lr
@@ -2052,6 +2052,7 @@ class COINPPOAgent(PPOAgent):
         env: gym.Env,
         context_probs_fn,
         n_episodes: int = 2,
+        max_steps_per_episode: int = 200,
         ignore_novel: bool = False,
     ) -> List[float]:
         """
@@ -2086,7 +2087,7 @@ class COINPPOAgent(PPOAgent):
             done = False
             trunc = False
 
-            while not done and not trunc:
+            for _ in range(max_steps_per_episode):
                 logits, value_est = self._mixed_outputs(obs_t, ctx_probs)
                 dist = torch.distributions.Categorical(logits=logits)
                 action = dist.sample()
@@ -2101,6 +2102,9 @@ class COINPPOAgent(PPOAgent):
                 obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
 
                 episode_reward += reward
+
+                if done or trunc:
+                    break
 
             rewards.append(episode_reward)
 
