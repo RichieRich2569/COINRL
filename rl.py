@@ -1822,91 +1822,262 @@ class EmbodiedCOINPPOAgent(PPOAgent):
 
 class COINPPOAgent(PPOAgent):
     """
-    COINstyle contextual PPO.
-    Keeps one policy+value pair *per context* and mixes them using p(c|s).
-    context_probs_fn(s) must return a Dict[int, float] mapping context id -> prob. In general this
-    takes in a vector of observations s. For simplicity here, we split COIN from the model, and allow them to 
-    connect via s being the episode number of the current epoch.
+    COIN-style contextual PPO (NO BODY).
+
+    Parallel to EmbodiedCOINPPOAgent, but assumes the body contribution is identically zero:
+      - no body networks are created
+      - action/value are obtained purely by mixing contextual heads using ctx_probs
+
+    ctx_probs convention:
+      - We fix an ordering of contexts: self.context_keys = list(ctx_ids) + ["novel"]
+      - Column j of ctx_probs corresponds to self.context_keys[j]
     """
-    def __init__(self, env, ctx_ids: dict, action_continuous: bool = False, **kwargs):
-        super().__init__(env, **kwargs)  # create *dummy* nets
-        # override: keep dicts of networks
-        self.context_nets: Dict[int, Tuple[nn.Module, nn.Module, optim.Optimizer]] = {}
-        self.act_dim = env.action_space.shape[0] if action_continuous else env.action_space.n
-        self.base_obs_dim = env.observation_space.shape[0]
+
+    def __init__(
+        self,
+        env: gym.Env,
+        ctx_ids: dict,
+        **kwargs,
+    ):
+        super().__init__(env, **kwargs)
+
+        # ---- context bookkeeping ----
+        self.context_keys = list(ctx_ids)
+        if "novel" not in self.context_keys:
+            self.context_keys.append("novel")
+        self.cid_to_index = {cid: i for i, cid in enumerate(self.context_keys)}
+        self.num_contexts = len(self.context_keys)
+
+        # context_init[cid] = 0/1 -> whether that context head is instantiated
+        self.context_init = {cid: 0 for cid in self.context_keys}
+        self.context_init["novel"] = 1
+
+        # ---- learning rate ----
         self.lr = kwargs.get("lr", 3e-4)
 
-        self.action_continuous = action_continuous
+        # ---- Per-context networks ----
+        #   self.nets[cid] = (optimizer, policy_net, value_net, log_std_param_or_tensor)
+        self.nets: Dict[Any, Tuple[optim.Optimizer, nn.Module, nn.Module, Optional[torch.Tensor]]] = {}
 
-        # track which contexts have been initialised - only novel initialised initially
-        self.context_init = {}
-        for ctx in ctx_ids:
-            self.context_init[ctx] = 0
-        self.context_init["novel"] = 1  # always have a 'novel' context
-        
         # Create initial 'novel' context networks
-        policy = _MLP(self.base_obs_dim, self.act_dim).to(self.device)
-        value_net = _MLP(self.base_obs_dim, 1).to(self.device)
-        opt = optim.Adam(
-            list(policy.parameters()) + list(value_net.parameters()),
-            lr=self.lr
-        )
-        self.context_nets["novel"] = (policy, value_net, opt)
+        policy = _MLP(self.obs_dim, self.act_dim).to(self.device)
+        value_net = _MLP(self.obs_dim, 1).to(self.device)
+        if self.action_continuous:
+            # Fixed log_std (tensor) - no learning for simplicity
+            log_std = torch.ones(self.act_dim, device=self.device) * np.log(0.5)
+        else:
+            log_std = None
 
-    # -------- helper to mix outputs ---------
-    def _mixed_outputs(self, obs_t: torch.Tensor, ctx_probs: Dict[int, float]):
-        """
-        Return context weighted logits and value.
-        """
-        logits_list, value_list, weight_list = [], [], []
+        params = list(policy.parameters()) + list(value_net.parameters())
+        opt = optim.Adam(params, lr=self.lr)
+        self.nets["novel"] = (opt, policy, value_net, log_std)
 
-        for cid, p_c in ctx_probs.items():
-            if self.context_init[cid] == 0 or np.isnan(p_c) or p_c == 0.0:
-                continue
-            policy, value_net, _ = self.context_nets[cid]
-            logits_list.append(policy(obs_t))        # [A]  requires_grad = True
-            value_list.append(value_net(obs_t))      # [1]  requires_grad = True
-            weight_list.append(p_c)
+        # ---- evaluation shadows (CPU) ----
+        self._eval_context_policies_cpu: Dict[Any, nn.Module] = {}
+        self._eval_context_values_cpu: Dict[Any, nn.Module] = {}
 
-        if not logits_list:
-            raise RuntimeError("All context probabilities were NaN or zero.")
+    # ------------------------------------------------------------------
+    # Context instantiation
+    # ------------------------------------------------------------------
+    def _instantiate_context_net(self, new_cid):
+        """When a new context is instantiated, copy 'novel' networks to the new context."""
+        if new_cid in self.nets:
+            return
 
-        # Stack and weight
-        logits   = torch.stack(logits_list)                    # [C, A]
-        values   = torch.stack(value_list).squeeze(-1)         # [C]
-        weights  = torch.tensor(weight_list, device=self.device)  # [C]
-
-        mixed_logits = (weights[:, None] * logits).sum(dim=0)  # [A]
-        mixed_value  = (weights * values).sum()                # scalar
-
-        return mixed_logits, mixed_value
-    
-    def instantiate_context_net(
-            self,
-            new_cid,
-    ):
-        """When a novel context is instantiated, copy novel network to the new context value"""
-        pnovel, vn_novel, _ = self.context_nets["novel"]
+        _, pnovel, vn_novel, log_std_novel = self.nets["novel"]
         policy = copy.deepcopy(pnovel).to(self.device)
         value_net = copy.deepcopy(vn_novel).to(self.device)
-        opt = optim.Adam(
-            list(policy.parameters()) + list(value_net.parameters()),
-            lr=self.lr
-        )
-        self.context_nets[new_cid] = (policy, value_net, opt)
+        log_std = log_std_novel.clone().to(self.device) if log_std_novel is not None else None
 
-    # ------------- public API -------------
-    def act(self, obs: torch.Tensor, ctx_probs: Dict[int, float]):
-        logits, _ = self._mixed_outputs(obs, ctx_probs)
+        params = list(policy.parameters()) + list(value_net.parameters())
+        opt = optim.Adam(params, lr=self.lr)
+        self.nets[new_cid] = (opt, policy, value_net, log_std)
+        self.context_init[new_cid] = 1
+
+    # ------------------------------------------------------------------
+    # Mixed logits (discrete)
+    # ------------------------------------------------------------------
+    def _mixed_logits(self, obs_t: torch.Tensor, ctx_probs: torch.Tensor):
+        """
+        Context-weighted logits, batched.
+
+        obs_t:     [B, obs_dim]
+        ctx_probs: [B, N], N == self.num_contexts
+        Returns:   [B, act_dim]
+        """
+        B = obs_t.shape[0]
+        device = obs_t.device
+
+        if ctx_probs.dim() == 1:
+            ctx_probs = ctx_probs.unsqueeze(0)
+        ctx_probs = ctx_probs.to(device)
+
+        if ctx_probs.size(1) != self.num_contexts:
+            raise ValueError(
+                f"ctx_probs second dim {ctx_probs.size(1)} != num_contexts {self.num_contexts}"
+            )
+
+        mixed_logits = torch.zeros(B, self.act_dim, device=device)
+
+        for j, cid in enumerate(self.context_keys):
+            if self.context_init.get(cid, 0) == 0:
+                continue
+            _, policy, _, _ = self.nets[cid]
+            logits_c = policy(obs_t)                     # [B, act_dim]
+            w_c = ctx_probs[:, j].view(B, 1)            # [B, 1]
+            mixed_logits = mixed_logits + w_c * logits_c
+
+        return mixed_logits
+
+    # ------------------------------------------------------------------
+    # Mixed value (critic)
+    # ------------------------------------------------------------------
+    def _mixed_value(self, obs_t: torch.Tensor, ctx_probs: torch.Tensor):
+        """
+        Context-weighted value, batched.
+
+        obs_t:     [B, obs_dim]
+        ctx_probs: [B, N], N == self.num_contexts
+        Returns:   [B]
+        """
+        B = obs_t.shape[0]
+        device = obs_t.device
+
+        if ctx_probs.dim() == 1:
+            ctx_probs = ctx_probs.unsqueeze(0)
+        ctx_probs = ctx_probs.to(device)
+
+        if ctx_probs.size(1) != self.num_contexts:
+            raise ValueError(
+                f"ctx_probs second dim {ctx_probs.size(1)} != num_contexts {self.num_contexts}"
+            )
+
+        mixed_value = torch.zeros(B, device=device)
+
+        for j, cid in enumerate(self.context_keys):
+            if self.context_init.get(cid, 0) == 0:
+                continue
+            _, _, value_net, _ = self.nets[cid]
+            v_c = value_net(obs_t).squeeze(-1)          # [B]
+            w_c = ctx_probs[:, j]                       # [B]
+            mixed_value = mixed_value + w_c * v_c
+
+        return mixed_value
+
+    # ------------------------------------------------------------------
+    # Mixed Gaussian (continuous)
+    # ------------------------------------------------------------------
+    def _mixed_gaussian(self, obs_t: torch.Tensor, ctx_probs: torch.Tensor):
+        """
+        Precision-weighted combination of context Gaussians (batched), no body component.
+
+        obs_t:     [B, obs_dim]
+        ctx_probs: [B, N]
+        Returns:
+            mixed_mu:  [B, act_dim]
+            mixed_std: [B, act_dim]
+        """
+        B = obs_t.shape[0]
+        device = obs_t.device
+
+        if ctx_probs.dim() == 1:
+            ctx_probs = ctx_probs.unsqueeze(0)
+        ctx_probs = ctx_probs.to(device)
+
+        if ctx_probs.size(1) != self.num_contexts:
+            raise ValueError(
+                f"ctx_probs second dim {ctx_probs.size(1)} != num_contexts {self.num_contexts}"
+            )
+
+        mus, stds, weights = [], [], []
+
+        for j, cid in enumerate(self.context_keys):
+            if self.context_init.get(cid, 0) == 0:
+                continue
+
+            _, policy, _, log_std = self.nets[cid]
+            if log_std is None:
+                raise RuntimeError("Continuous actions require log_std for each context.")
+
+            mu = policy(obs_t)                                           # [B, act_dim]
+            std = log_std.exp().view(1, -1).expand_as(mu)                # [B, act_dim]
+            alpha = ctx_probs[:, j].view(B, 1)                           # [B, 1]
+
+            mus.append(mu)
+            stds.append(std)
+            weights.append(alpha)
+
+        if not mus:
+            raise RuntimeError("No Gaussian components collected (all contexts inactive).")
+
+        mus = torch.stack(mus, dim=0)        # [C, B, act_dim]
+        stds = torch.stack(stds, dim=0)      # [C, B, act_dim]
+        weights = torch.stack(weights, dim=0)  # [C, B, 1]
+
+        # Normalise weights per sample
+        weight_sum = weights.sum(dim=0, keepdim=True).clamp_min(1e-8)  # [1, B, 1]
+        alphas = weights / weight_sum                                   # [C, B, 1]
+
+        precisions = 1.0 / (stds ** 2)                                  # [C, B, act_dim]
+        S_bar = (alphas * precisions).sum(dim=0)                        # [B, act_dim]
+        num = (alphas * precisions * mus).sum(dim=0)                    # [B, act_dim]
+
+        mixed_mu = num / S_bar
+        mixed_std = torch.sqrt(1.0 / S_bar)
+
+        return mixed_mu, mixed_std
+
+    def _all_optimizers(self):
+        """All context optimizers."""
+        return [opt for (opt, _, _, _) in self.nets.values() if opt is not None]
+
+    # ------------------------------------------------------------------
+    # Action selection
+    # ------------------------------------------------------------------
+    def act(self, obs: torch.Tensor, ctx_probs: torch.Tensor):
+        """
+        Generate action given observation and context probabilities.
+
+        obs:        [obs_dim] or [B, obs_dim]
+        ctx_probs:  [N] or [B, N]
+        """
+        if obs.dim() == 1:
+            obs_t = obs.unsqueeze(0)
+        else:
+            obs_t = obs
+
+        if ctx_probs.dim() == 1:
+            ctx_t = ctx_probs.unsqueeze(0)
+        else:
+            ctx_t = ctx_probs
+
+        if self.action_continuous:
+            mixed_mu, mixed_std = self._mixed_gaussian(obs_t, ctx_t)
+            dist = torch.distributions.Normal(mixed_mu, mixed_std)
+            raw_action = dist.sample()
+
+            action = raw_action
+            if self.act_low is not None and self.act_high is not None:
+                action = torch.max(torch.min(action, self.act_high), self.act_low)
+
+            logp = dist.log_prob(action).sum(-1)
+            entropy = dist.entropy().sum(-1)
+
+            action_np = action.detach().cpu().numpy()
+            return action_np.squeeze(0), logp.squeeze(0), entropy.squeeze(0), mixed_mu.squeeze(0)
+
+        logits = self._mixed_logits(obs_t, ctx_t)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
+        logp = dist.log_prob(action)
+        entropy = dist.entropy()
+
         action_np = action.detach().cpu().numpy()
+        return action_np.squeeze(0), logp.squeeze(0), entropy.squeeze(0), logits.squeeze(0)
 
-        if action_np.shape == ():  # scalar case
-            action_np = np.array([action_np])  # wrap in 1D array
-
-        return action_np
-
+    # ------------------------------------------------------------------
+    # Training step
+    # ------------------------------------------------------------------
     def train_step(
         self,
         env,
@@ -1916,51 +2087,46 @@ class COINPPOAgent(PPOAgent):
         mb_size: int = 64,
     ):
         """
-        context_probs_fn: lambda eps_num -> {context_id: prob}
-        Otherwise same interface as PPOAgent.
+        context_probs_fn: function that takes an episode index and returns [N] ctx probs
+                          aligned with self.context_keys.
         """
         obs = env.reset()[0]
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
 
-        ep_returns = []     # collect episodic returns for logging
-        ep_len = ep_ret = ep_num = 0
+        ep_returns = []
+        ep_ret = ep_len = ep_num = 0
 
         storage: Dict[str, List[Any]] = defaultdict(list)
 
         # ---------- rollout ----------
         for _ in range(rollout_steps):
-            ctx_probs = context_probs_fn(ep_num)
-            # Check if new context initialised
-            for ctx, init in self.context_init.items():
-                if init == 0 and not np.isnan(ctx_probs[ctx]):
-                    # Context initialised
-                    self.instantiate_context_net(ctx)
-                    # Update tracking
-                    self.context_init[ctx] = 1
+            ctx_probs_vec = np.asarray(context_probs_fn(ep_num), dtype=np.float32)  # [N]
 
-            logits, value_est = self._mixed_outputs(obs_t, ctx_probs)
-            dist = torch.distributions.Categorical(logits=logits)
-            action = dist.sample()
-            action_np = action.detach().cpu().numpy()
+            # instantiate any newly-active known contexts
+            for j, cid in enumerate(self.context_keys):
+                if cid == "novel":
+                    continue
+                if self.context_init[cid] == 0:
+                    p_c = ctx_probs_vec[j]
+                    if not np.isnan(p_c) and p_c != 0.0:
+                        self._instantiate_context_net(cid)
 
-            if self.action_continuous and action_np.shape == ():  # scalar case
-                action_np = np.array([action_np])  # wrap in 1D array
-            else:
-                action_np = action_np.item()
+            ctx_probs_t = torch.as_tensor(ctx_probs_vec, device=self.device, dtype=torch.float32)
 
-            logp = dist.log_prob(action)
-            entropy = dist.entropy()
+            with torch.no_grad():
+                value = self._mixed_value(obs_t.unsqueeze(0), ctx_probs_t.unsqueeze(0))[0].item()
+                action_np, logp, ent, _ = self.act(obs_t, ctx_probs_t)
 
             next_obs, reward, done, trunc, _ = env.step(action_np)
 
-            # store (we also keep ctx_probs to weight backprop)
             storage["obs"].append(obs_t.detach().cpu())
-            storage["act"].append(action.detach().cpu())
+            storage["act"].append(torch.as_tensor(action_np))
             storage["logp"].append(logp.detach().cpu())
             storage["rew"].append(reward)
-            storage["val"].append(value_est.detach().cpu())
+            storage["val"].append(torch.tensor(value, dtype=torch.float32))
             storage["done"].append(done or trunc)
-            storage["ctx_probs"].append(ctx_probs)
+            storage["ctx_probs"].append(torch.as_tensor(ctx_probs_vec, dtype=torch.float32))
+            storage["ent"].append(ent.detach().cpu())
 
             ep_ret += reward
             ep_len += 1
@@ -1968,145 +2134,208 @@ class COINPPOAgent(PPOAgent):
             if done or trunc:
                 next_obs, _ = env.reset()
                 ep_returns.append(ep_ret)
-                ep_len = ep_ret = 0
-                next_obs, _ = env.reset()
+                ep_ret = ep_len = 0
                 ep_num += 1
 
-            obs, obs_t = next_obs, torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
+            obs_t = self._flatten_obs(next_obs)
 
-        # ---------- advantages ----------
+        # ---------- advantages / returns ----------
         with torch.no_grad():
-            last_ctx_probs = context_probs_fn(obs)
-            _, last_val = self._mixed_outputs(obs_t, last_ctx_probs)
-            last_val = last_val.item()
+            last_ctx_probs_vec = np.asarray(context_probs_fn(ep_num), dtype=np.float32)
+            last_ctx_probs_t = torch.as_tensor(last_ctx_probs_vec, device=self.device, dtype=torch.float32)
+            last_val = self._mixed_value(obs_t.unsqueeze(0), last_ctx_probs_t.unsqueeze(0))[0].item()
 
-        adv, ret = self._compute_advantages(storage["rew"], storage["val"], storage["done"], last_val)
+        val_tensor = torch.stack(storage["val"])
+        adv, ret = self._compute_advantages(storage["rew"], val_tensor, storage["done"], last_val)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # ---------- optimisation per context ----------
-        # For simplicity: compute global indices and then distribute grads by importance sampling
+        # ---------- tensors ----------
         dataset_size = rollout_steps
         idxs = torch.randperm(dataset_size)
+
+        obs_tensor = torch.stack(storage["obs"]).to(self.device)
+        ctx_probs_tensor = torch.stack(storage["ctx_probs"]).to(self.device)
+
+        if self.action_continuous:
+            act_tensor = torch.stack(storage["act"]).to(self.device).float()
+        else:
+            act_tensor = torch.stack(storage["act"]).to(self.device).long()
+
+        old_logp_tensor = torch.stack(storage["logp"]).to(self.device).float()
+        ret_tensor = ret.to(self.device).float()
+        adv_tensor = adv.to(self.device).float()
+
+        # ---------- optimisation ----------
         for _ in range(mini_epochs):
             for start in range(0, dataset_size, mb_size):
                 end = start + mb_size
                 mb_idx = idxs[start:end]
 
-                # For each initialised context, gather the subset where p(c|s) > 0 and not NaN
-                ctx_grad_accum = {cid: [] for cid in self.context_nets}
-                for j in mb_idx:
-                    ctx_probs = storage["ctx_probs"][j]
-                    for cid, p_c in ctx_probs.items():
-                        if self.context_init == 0 or np.isnan(p_c):
-                            continue
-                        ctx_grad_accum[cid].append((j, p_c))
+                batch_obs = obs_tensor[mb_idx]
+                batch_act = act_tensor[mb_idx]
+                batch_adv = adv_tensor[mb_idx]
+                batch_ret = ret_tensor[mb_idx]
+                batch_old_logp = old_logp_tensor[mb_idx]
+                batch_ctx_probs = ctx_probs_tensor[mb_idx]
 
-                # Iterate contexts and do local PPO update (weighted by p_c)
-                for cid, items in ctx_grad_accum.items():
-                    if not items:  # no samples for this context in this minibatch
-                        continue
-                    j_idx = torch.tensor([j for j, _ in items], device=self.device)
-                    weights = torch.tensor([w for _, w in items], device=self.device)
-
-                    if not weights.sum():
-                        # all weights are zero, skip this context
-                        continue
-
-                    policy, value_net, opt = self.context_nets[cid]
-
-                    batch_obs = torch.stack([storage["obs"][k] for k in j_idx]).to(self.device)
-                    batch_act = torch.stack([storage["act"][k] for k in j_idx]).to(self.device)
-                    batch_old_logp = torch.stack([storage["logp"][k] for k in j_idx]).to(self.device)
-                    batch_adv = adv[j_idx]
-                    batch_ret = ret[j_idx]
-
-                    # We scale by the weights to decrease the learning rate proportional to the context probabilities
-                    logits = policy(batch_obs)
+                if self.action_continuous:
+                    mixed_mu, mixed_std = self._mixed_gaussian(batch_obs, batch_ctx_probs)
+                    dist = torch.distributions.Normal(mixed_mu, mixed_std)
+                    new_logp = dist.log_prob(batch_act).sum(-1)
+                    entropy = dist.entropy().sum(-1).mean()
+                else:
+                    logits = self._mixed_logits(batch_obs, batch_ctx_probs)
                     dist = torch.distributions.Categorical(logits=logits)
-                    new_logp = dist.log_prob(batch_act.squeeze())
-                    entropy = (dist.entropy()*weights).mean()
-                    ratio = torch.exp(new_logp - batch_old_logp)
+                    new_logp = dist.log_prob(batch_act)
+                    entropy = dist.entropy().mean()
 
-                    surr1 = ratio * batch_adv
-                    surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * batch_adv
-                    actor_loss = -(torch.min(surr1, surr2)*weights).mean()
-                    value_pred = value_net(batch_obs).squeeze()
-                    critic_loss = ((batch_ret - value_pred).pow(2)*weights).mean()
+                ratio = torch.exp(new_logp - batch_old_logp)
 
-                    loss = actor_loss + self.vf_coef * critic_loss - self.ent_coef * entropy
+                surr1 = ratio * batch_adv
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * batch_adv
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                value_pred = self._mixed_value(batch_obs, batch_ctx_probs)
+                critic_loss = (batch_ret - value_pred).pow(2).mean()
+
+                loss = actor_loss + self.vf_coef * critic_loss - self.ent_coef * entropy
+
+                for opt in self._all_optimizers():
                     opt.zero_grad()
-                    loss.backward()
+                loss.backward()
+                for opt in self._all_optimizers():
                     opt.step()
 
-        mean_ep_return = float(np.mean(ep_returns)) if ep_returns else 0.0
+        self._weights_version += 1
+        rew_buf = np.asarray(storage["rew"], dtype=float)
 
         return {
-                    "mean_episode_return": mean_ep_return,
-                    "mean_reward_per_step": np.mean(storage["rew"]),
-                    "value_loss": critic_loss.item(),
-                    "policy_loss": actor_loss.item(),
-               }  #  for logging
-    
+            "mean_episode_return": float(np.mean(ep_returns)) if ep_returns else 0.0,
+            "mean_reward_per_step": float(rew_buf.mean()) if rew_buf.size else 0.0,
+            "value_loss": float(critic_loss.item()),
+            "policy_loss": float(actor_loss.item()),
+        }
+
+    # ------------------------------------------------------------------
+    # Evaluation (optional CPU shadow)
+    # ------------------------------------------------------------------
+    def _get_eval_nets_cpu(self):
+        # Create missing CPU shadows for instantiated contexts
+        for cid in self.context_keys:
+            if self.context_init.get(cid, 0) == 0:
+                continue
+            if cid not in self._eval_context_policies_cpu:
+                self._eval_context_policies_cpu[cid] = _MLP(self.obs_dim, self.act_dim).cpu()
+                self._eval_context_values_cpu[cid] = _MLP(self.obs_dim, 1).cpu()
+
+        if self._eval_sync_version != self._weights_version:
+            for cid in self.context_keys:
+                if self.context_init.get(cid, 0) == 0:
+                    continue
+                _, policy, value_net, _ = self.nets[cid]
+                self._eval_context_policies_cpu[cid].load_state_dict(policy.state_dict())
+                self._eval_context_values_cpu[cid].load_state_dict(value_net.state_dict())
+            self._eval_sync_version = self._weights_version
+
+        return self._eval_context_policies_cpu, self._eval_context_values_cpu
+
     def evaluate(
         self,
         env: gym.Env,
         context_probs_fn,
         n_episodes: int = 2,
         max_steps_per_episode: int = 200,
-        ignore_novel: bool = False,
-    ) -> List[float]:
-        """
-        Execute the learned policies to evaluate performance.
-        This method does not train the model.
-
-        Args:
-            n_episodes (int, optional): Number of episodes to run for evaluation.
-            context_probs_fn: lambda obs -> {context_id: prob}
-            max_steps_per_episode (int, optional): Maximum steps to run in each episode.
-
-        Returns:
-            List[float]: Total rewards for each of the evaluation episodes.
-        """
+        deterministic: bool = True,
+        eval_on_cpu: bool = True,
+    ):
         rewards = []
-        ctx_probs = context_probs_fn(0) # dummy call to get context probabilities
 
-        ctx_array = np.array(list(ctx_probs.values()))
+        if eval_on_cpu and str(self.device).startswith("cuda"):
+            context_policies_cpu, _ = self._get_eval_nets_cpu()
+            device = "cpu"
+        else:
+            context_policies_cpu = {
+                cid: self.nets[cid][1]
+                for cid in self.context_keys
+                if self.context_init.get(cid, 0) == 1
+            }
+            device = self.device
 
-        if ignore_novel and np.nansum(ctx_array[:-1]) > 0:
-            ctx_sum = np.nansum(ctx_array[:-1]) + 1e-4
-            for ctx in ctx_probs:
-                if ctx != 'novel':
-                    ctx_probs[ctx] = ctx_probs[ctx] / ctx_sum
-                else:
-                    ctx_probs[ctx] = 0.0
+        for cid in context_policies_cpu:
+            context_policies_cpu[cid].eval()
 
-        for _ in range(n_episodes):
-            obs, _ = env.reset()
-            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-            episode_reward = 0.0
-            done = False
-            trunc = False
+        with torch.inference_mode():
+            for epnum in range(n_episodes):
+                obs = env.reset()[0]
+                ep_ret = 0.0
 
-            for _ in range(max_steps_per_episode):
-                logits, value_est = self._mixed_outputs(obs_t, ctx_probs)
-                dist = torch.distributions.Categorical(logits=logits)
-                action = dist.sample()
-                action_np = action.detach().cpu().numpy()
+                ctx_probs_vec = np.asarray(context_probs_fn(epnum), dtype=np.float32)
 
-                if self.action_continuous and action_np.shape == ():  # scalar case
-                    action_np = np.array([action_np])  # wrap in 1D array
-                else:
-                    action_np = action_np.item()
+                # All required contexts must be initialised (except novel, which always is)
+                for j, cid in enumerate(self.context_keys):
+                    p_c = ctx_probs_vec[j]
+                    if p_c != 0.0 and self.context_init.get(cid, 0) == 0:
+                        raise RuntimeError(
+                            f"Context ID {cid} required by context_probs_fn but not initialised."
+                        )
 
-                next_obs, reward, done, trunc, _ = env.step(action_np)
-                obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
+                ctx_probs = torch.as_tensor(ctx_probs_vec, device=device, dtype=torch.float32).unsqueeze(0)  # [1, N]
 
-                episode_reward += reward
+                for _ in range(max_steps_per_episode):
+                    # Ensure batched observation: [1, obs_dim]
+                    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).view(1, -1)
 
-                if done or trunc:
-                    break
+                    # Collect mus/logits for all active contexts in fixed order (batched)
+                    # ctx_probs: [1, N]
+                    alphas = []
+                    mus = []
 
-            rewards.append(episode_reward)
+                    for j, cid in enumerate(self.context_keys):
+                        if self.context_init.get(cid, 0) == 0:
+                            continue
 
-        env.close()
+                        mus.append(context_policies_cpu[cid](obs_t))      # obs_t: [1, obs_dim] -> [1, act_dim]
+                        alphas.append(ctx_probs[:, j].view(1, 1))         # [1, 1]
+
+                    mus = torch.stack(mus, dim=0)                         # [C, 1, act_dim]
+                    alphas = torch.stack(alphas, dim=0)                   # [C, 1, 1]
+
+                    # Normalise weights safely (handle NaNs)
+                    alphas = torch.nan_to_num(alphas, nan=0.0)
+                    wsum = alphas.sum(dim=0, keepdim=True).clamp_min(1e-8)    # [1, 1, 1]
+                    alphas = alphas / wsum                                    # [C, 1, 1]
+
+                    if self.action_continuous:
+                        stds = []
+                        for cid in [c for c in self.context_keys if self.context_init.get(c, 0) == 1]:
+                            log_std = self.nets[cid][3]
+                            if log_std is None:
+                                raise RuntimeError("Continuous actions require log_std for each context.")
+                            stds.append(log_std.exp().view(1, -1).expand_as(mus[0]))  # [1, act_dim]
+                        stds = torch.stack(stds, dim=0)                               # [C, 1, act_dim]
+
+                        precisions = 1.0 / (stds ** 2)                                # [C, 1, act_dim]
+                        S_bar = (alphas * precisions).sum(dim=0)                      # [1, act_dim]
+                        num = (alphas * precisions * mus).sum(dim=0)                  # [1, act_dim]
+                        mixed_mu = num / S_bar                                        # [1, act_dim]
+                        mixed_std = torch.sqrt(1.0 / S_bar)                           # [1, act_dim]
+
+                        a = mixed_mu if deterministic else torch.distributions.Normal(mixed_mu, mixed_std).sample()
+                        action = a.detach().cpu().numpy().astype(np.float32)          # [1, act_dim]
+                        action = np.clip(action, self.act_low_np, self.act_high_np).squeeze(0)  # [act_dim]
+
+                    else:
+                        mixed_logits = (alphas * mus).sum(dim=0)                      # [1, act_dim]
+                        if deterministic:
+                            action = int(torch.argmax(mixed_logits, dim=-1).item())
+                        else:
+                            action = int(torch.distributions.Categorical(logits=mixed_logits).sample().item())
+
+                    obs, reward, done, trunc, _ = env.step(action)
+                    ep_ret += float(reward)
+                    if done or trunc:
+                        break
+
+                rewards.append(ep_ret)
+
         return rewards

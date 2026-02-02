@@ -405,3 +405,87 @@ class CustomMountainCarEnv(TimeLimitMixin, MountainCarEnv):
             return np.transpose(
                 np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2)
             )
+
+class _PadToAcrobotInterfaceMixin:
+    """
+    Standardise (obs_dim, n_actions) to match Acrobot:
+      - obs padded to 6 (zeros appended)
+      - action space promoted to Discrete(3)
+      - info["action_mask"] indicates which actions are valid for the underlying env
+    """
+
+    TARGET_OBS_DIM = 6
+    TARGET_N_ACTIONS = 3
+
+    def _init_acrobot_interface(self):
+        # Expect underlying env already set its spaces in __init__
+        assert isinstance(self.observation_space, gym.spaces.Box), "Obs space must be Box"
+        assert isinstance(self.action_space, gym.spaces.Discrete), "Action space must be Discrete"
+
+        orig_shape = self.observation_space.shape
+        assert orig_shape is not None and len(orig_shape) == 1, "Obs must be 1D Box"
+        self._orig_obs_dim = int(orig_shape[0])
+        self._orig_n_actions = int(self.action_space.n)
+
+        if self._orig_obs_dim > self.TARGET_OBS_DIM:
+            raise ValueError(f"orig obs dim {self._orig_obs_dim} > target {self.TARGET_OBS_DIM}")
+        if self._orig_n_actions > self.TARGET_N_ACTIONS:
+            raise ValueError(f"orig n_actions {self._orig_n_actions} > target {self.TARGET_N_ACTIONS}")
+
+        # Override *exposed* spaces to the shared interface
+        low = np.full((self.TARGET_OBS_DIM,), -np.inf, dtype=np.float32)
+        high = np.full((self.TARGET_OBS_DIM,),  np.inf, dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        self.action_space = gym.spaces.Discrete(self.TARGET_N_ACTIONS)
+
+    def _pad_obs(self, obs):
+        obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+        out = np.zeros((self.TARGET_OBS_DIM,), dtype=np.float32)
+        out[: self._orig_obs_dim] = obs[: self._orig_obs_dim]
+        return out
+
+    def _action_mask(self):
+        mask = np.zeros((self.TARGET_N_ACTIONS,), dtype=np.int8)
+        mask[: self._orig_n_actions] = 1
+        return mask
+
+    def reset(self, **kwargs):
+        obs, info = super().reset(**kwargs)
+        info = dict(info) if info is not None else {}
+        info["action_mask"] = self._action_mask()
+        return self._pad_obs(obs), info
+
+    def step(self, action):
+        action = int(action)
+
+        # Remap invalid actions to a valid one (keeps training stable).
+        # Alternative: penalise + terminate, if you prefer.
+        if action >= self._orig_n_actions:
+            action = self._orig_n_actions - 1
+
+        obs, reward, terminated, truncated, info = super().step(action)
+        info = dict(info) if info is not None else {}
+        info["action_mask"] = self._action_mask()
+        return self._pad_obs(obs), reward, terminated, truncated, info
+
+
+class MountainCarXEnv(_PadToAcrobotInterfaceMixin, CustomMountainCarEnv):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_acrobot_interface()
+
+
+class CartPoleXEnv(_PadToAcrobotInterfaceMixin, CustomCartPoleEnv):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_acrobot_interface()
+
+
+class AcrobotXEnv(_PadToAcrobotInterfaceMixin, CustomAcrobotEnv):
+    """
+    For consistency: Acrobot already has obs_dim=6, n_actions=3,
+    so this is effectively a no-op except for always providing action_mask.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_acrobot_interface()
