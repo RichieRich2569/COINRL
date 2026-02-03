@@ -462,7 +462,7 @@ class COIN:
             coin_state["Q"] = 0
             
             # cue emission counts
-            coin_state["n_cue"] = np.zeros((self.max_contexts + 1, np.max(self.cues) + 1, self.particles))
+            coin_state["n_cue"] = np.zeros((self.max_contexts + 1, np.max(self.cues) + 1, self.particles), dtype=int)
             
         # sufficient statistics for the parameters of the state dynamics function
         coin_state["dynamics_ss_1"] = np.zeros((self.max_contexts + 1, self.particles, 2))
@@ -505,7 +505,7 @@ class COIN:
         if coin_state["cues_exist"]:
             cue_probabilities = np.zeros((self.max_contexts+1, self.particles))
             inds_1 = np.tile(np.arange(self.max_contexts+1)[None], (self.particles, 1)).T
-            inds_2 = np.ones((self.max_contexts+1, self.particles), dtype=int) * self.cues[coin_state["trial"]-1]
+            inds_2 = np.ones((self.max_contexts+1, self.particles), dtype=int) * (self.cues[coin_state["trial"]-1] - 1)
             inds_3 = np.tile(np.arange(self.particles)[None], (self.max_contexts+1, 1))
             
             for i in range(self.max_contexts+1):
@@ -724,8 +724,8 @@ class COIN:
                 # sample the next stick-breaking weight
                 sb_weight = np.random.beta(1, self.gamma_cue * np.ones((self.particles, )))
                 
-                coin_state["global_cue_probabilities"][coin_state["Q"]+1, :] = coin_state["global_cue_probabilities"][coin_state["Q"], :] * (1 - sb_weight)
-                coin_state["global_cue_probabilities"][coin_state["Q"], :] = coin_state["global_cue_probabilities"][coin_state["Q"], :] * sb_weight
+                coin_state["global_cue_probabilities"][coin_state["Q"], :] = coin_state["global_cue_probabilities"][coin_state["Q"]-1, :] * (1 - sb_weight)
+                coin_state["global_cue_probabilities"][coin_state["Q"]-1, :] = coin_state["global_cue_probabilities"][coin_state["Q"]-1, :] * sb_weight
                 
         return coin_state
     
@@ -846,14 +846,8 @@ class COIN:
         """Renumber cues according to the order they are presented in the experiments.
         They are numbered starting from 1, in ascending order such that if cue x shows up, then cues x-1,x-2,...,1 must have shown up before.
         """
-        cue_order = np.unique(self.cues)
-        
-        if self.cues.ndim == 1:
-            self.cues = np.where(np.isin(cue_order, self.cues))
-        else:
-            cues = np.where(np.isin(cue_order, self.cues.T))
-            self.cues = cues.T
-        
+        _, inverse_indices = np.unique(self.cues, return_inverse=True)
+        self.cues = inverse_indices + 1 # Convert 0-based to 1-based
         print("Cues have been numbered according to the order they were presented in the experiments.")
         
     def sample_parameters(self, coin_state: Dict[str, Any]):
@@ -937,14 +931,14 @@ class COIN:
             coin_state["global_cue_probabilities"][0, :] = 1.0
         else:
             # sample the number of tables in restaurant i serving dish j
-            coin_state["m_cue"] = sample_num_tables_CRF(
+            coin_state["m_cue"], _, _, _ = sample_num_tables_CRF(
                 np.tile(self.alpha_cue * coin_state["global_cue_probabilities"][None], (self.max_contexts+1, 1, 1)), 
                 coin_state["n_cue"], 
             )
             
             # sample beta_e (for cue CRF)
             coin_state["global_cue_posterior"] = np.reshape(np.sum(coin_state["m_cue"], axis=0), (np.max(self.cues)+1, self.particles))
-            coin_state["global_cue_posterior"][coin_state["Q"]+1, :] = self.gamma_cue
+            coin_state["global_cue_posterior"][coin_state["Q"], :] = self.gamma_cue
             
             coin_state["global_cue_probabilities"] = random_dirichlet(coin_state["global_cue_posterior"])
         
@@ -1028,7 +1022,7 @@ class COIN:
             self.prior_precision_bias * bias_mean + coin_state["bias_ss_1"] / (coin_state["sigma_observation_noise"] ** 2)
         )
         
-        coin_state["bias"] = random_univariate_normal(coin_state["bias_mean"], coin_state["bias_var"], self.particles, self.max_contexts)
+        coin_state["bias"] = random_univariate_normal(coin_state["bias_mean"], coin_state["bias_var"], self.particles, self.max_contexts + 1)
         
         return coin_state
     
@@ -1088,7 +1082,7 @@ class COIN:
     
     def update_sufficient_statistics_global_cue_probabilities(self, coin_state: Dict[str, Any]):
         inds_1 = coin_state["context"] - 1 # TODO: is the -1 right?
-        inds_2 = self.cues[coin_state["trial"]-1] * np.ones((self.particles, ), dtype=int)
+        inds_2 = (self.cues[coin_state["trial"]-1] - 1) * np.ones((self.particles, ), dtype=int)
         inds_3 = np.arange(self.particles)
         
         for i in range(self.particles):
