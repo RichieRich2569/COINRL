@@ -45,6 +45,85 @@ def discretize_state(
 
     return (pos_index, vel_index)
 
+#----- COIN interface helpers -----
+
+def coin_context_vector(
+    vec: np.ndarray,
+    k: int,
+    width: Optional[int] = None,
+    renormalise_novel: bool = True,
+) -> np.ndarray:
+    """
+    Convert one fixed-width realtimecoin context vector into the agent convention.
+
+    ``RealTimeCOIN`` queries return a fixed-width ``(max_contexts + 1,)`` vector in which
+    indices ``0 .. k-1`` hold the known (globally aligned) contexts, index ``k`` holds the
+    novel context, and every index above ``k`` is a padding zero. The agents in this module
+    instead expect ``(width,)`` laid out as **known first, novel last**, with ``np.nan``
+    marking a context slot that has not been instantiated yet (as opposed to an
+    instantiated context with zero responsibility).
+
+    Args:
+        vec (np.ndarray): A fixed-width realtimecoin query vector for a single trial.
+        k (int): The number of known contexts for that trial, i.e. ``context_alignment()["K"]``.
+        width (Optional[int]): Length of the returned vector. Defaults to ``k + 1``
+            (known contexts plus novel, no uninstantiated padding).
+        renormalise_novel (bool): If True (default), overwrite the novel entry with
+            ``1 - sum(known)`` — the notebooks' novel-column fix, which makes each row sum
+            to one after the padding slots are treated as zero. Pass False for raw
+            responsibility traces, which are deliberately left unnormalised.
+
+    Returns:
+        np.ndarray: A ``(width,)`` float array ``[known..., nan..., novel]``.
+    """
+    k = int(k)
+    width = (k + 1) if width is None else int(width)
+    out = np.full(width, np.nan)
+    out[:k] = vec[:k]          # known (globally aligned) contexts
+    out[-1] = vec[k]           # novel
+    if renormalise_novel:
+        out[-1] = 1.0 - np.sum(np.nan_to_num(out[:-1]))
+    return out
+
+
+def coin_context_trace(
+    vecs: np.ndarray,
+    ks: np.ndarray,
+    width: Optional[int] = None,
+    renormalise_novel: bool = True,
+) -> np.ndarray:
+    """
+    Convert a whole trial-by-trial trace of realtimecoin vectors into the agent convention.
+
+    Applies :func:`coin_context_vector` to each trial, so every row is laid out as
+    **known contexts first, novel last**, with ``np.nan`` marking context slots that had
+    not been instantiated on that trial. All rows share one common width so the result is
+    a rectangular array.
+
+    Args:
+        vecs (np.ndarray): Fixed-width realtimecoin query vectors, one row per trial.
+        ks (np.ndarray): Per-trial number of known contexts, i.e. ``context_alignment()["K"]``.
+        width (Optional[int]): Common row length. Defaults to ``max(ks) + 1``.
+        renormalise_novel (bool): If True (default), set each row's novel entry to
+            ``1 - sum(known)`` — the notebooks' novel-column fix. Pass False for raw
+            responsibility traces, which are deliberately left unnormalised.
+
+    Returns:
+        np.ndarray: A ``(len(ks), width)`` float array.
+    """
+    ks = np.asarray(ks, dtype=int)
+    width = (int(ks.max()) + 1) if width is None else int(width)
+    return np.stack([coin_context_vector(vecs[t], ks[t], width, renormalise_novel)
+                     for t in range(len(ks))])
+
+
+def _as_context_probs_fn(context_probs):
+    """Accept either a callable episode -> probs, or a constant (N,) array."""
+    if callable(context_probs):
+        return context_probs
+    snapshot = np.array(context_probs, dtype=float)   # eager copy, float64
+    return lambda _ep: snapshot
+
 #----- Exploration Strategies -----
 
 @runtime_checkable
@@ -560,6 +639,13 @@ class COINQLearningAgent:
                 p = float(p_context[i])
                 self.Qdat[i][state][action] += p * self.alpha * td_error / max(Z, 1e-8)
 
+    def _pad_p_context(self, p_context: np.ndarray) -> np.ndarray:
+        """Pad a shorter (C+1,) vector to (max_contexts+1,), keeping novel last."""
+        if p_context.shape[0] < len(self.context_init):
+            pad = np.full(len(self.context_init) - p_context.shape[0], np.nan)
+            p_context = np.concatenate([p_context[:-1], pad, p_context[-1:]])
+        return p_context
+
     def instantiate_context_Q(
         self,
         new_context: int,
@@ -595,10 +681,7 @@ class COINQLearningAgent:
 
         # p_context may not be the same size as max_contexts+1
         # rearrange it to extend it, moving novel to the end
-        if p_context.shape[0] < len(self.context_init):
-            B = np.array([np.nan] * (len(self.context_init) - p_context.shape[0]))
-            B = np.expand_dims(B, axis=-1)
-            p_context = np.vstack([p_context[:-1], B, p_context[-1:]])
+        p_context = self._pad_p_context(p_context)
 
         # Instantiate any new contexts that became active
         for i, init in enumerate(self.context_init):
@@ -677,6 +760,8 @@ class COINQLearningAgent:
         Execute the learned policy (greedy w.r.t. the averaged Q-table) to evaluate performance.
         """
         rewards: List[float] = []
+
+        p_context = self._pad_p_context(p_context)
 
         if ignore_novel and np.nansum(p_context[:-1]) > 0:
             p_context = p_context.copy()
@@ -1507,12 +1592,14 @@ class EmbodiedCOINPPOAgent(PPOAgent):
         mb_size: int = 64,
     ):
         """
-        context_probs_fn: function that, given an episode index (or step index),
-                          returns an array-like [N] of context probabilities,
-                          where index j corresponds to self.context_keys[j].
+        context_probs_fn: either a function that, given an episode index (or step index),
+                          returns an array-like [N] of context probabilities, or a constant
+                          array-like [N] used for every episode, where index j corresponds
+                          to self.context_keys[j].
 
         Otherwise same interface as PPOAgent.
         """
+        context_probs_fn = _as_context_probs_fn(context_probs_fn)
         obs = env.reset()[0]
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
 
@@ -1690,10 +1777,12 @@ class EmbodiedCOINPPOAgent(PPOAgent):
         Execute the learned policies to evaluate performance.
         This method does not train the model.
 
-        context_probs_fn: function that, given an episode index (or step index),
-                          returns an array-like [N] of context probabilities,
-                          where index j corresponds to self.context_keys[j].
+        context_probs_fn: either a function that, given an episode index (or step index),
+                          returns an array-like [N] of context probabilities, or a constant
+                          array-like [N] used for every episode, where index j corresponds
+                          to self.context_keys[j].
         """
+        context_probs_fn = _as_context_probs_fn(context_probs_fn)
         rewards = []
 
         if eval_on_cpu and str(self.device).startswith("cuda"):
@@ -2087,9 +2176,11 @@ class COINPPOAgent(PPOAgent):
         mb_size: int = 64,
     ):
         """
-        context_probs_fn: function that takes an episode index and returns [N] ctx probs
-                          aligned with self.context_keys.
+        context_probs_fn: either a function that takes an episode index and returns [N] ctx
+                          probs, or a constant array-like [N] used for every episode; in
+                          both cases aligned with self.context_keys.
         """
+        context_probs_fn = _as_context_probs_fn(context_probs_fn)
         obs = env.reset()[0]
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
 
@@ -2248,6 +2339,15 @@ class COINPPOAgent(PPOAgent):
         deterministic: bool = True,
         eval_on_cpu: bool = True,
     ):
+        """
+        Execute the learned policies to evaluate performance.
+        This method does not train the model.
+
+        context_probs_fn: either a function that takes an episode index and returns [N] ctx
+                          probs, or a constant array-like [N] used for every episode; in
+                          both cases aligned with self.context_keys.
+        """
+        context_probs_fn = _as_context_probs_fn(context_probs_fn)
         rewards = []
 
         if eval_on_cpu and str(self.device).startswith("cuda"):
