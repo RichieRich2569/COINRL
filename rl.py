@@ -45,6 +45,35 @@ def discretize_state(
 
     return (pos_index, vel_index)
 
+#----- Fig. 2 probe helpers (shared by COIN-Q and all baselines) -----
+
+def amplitude_estimator(s1, s2, a, F: float = 0.001, g: float = 0.0025) -> float:
+    """
+    Estimates the amplitude term of a standard mountain car environment assuming
+    accurate observation and dynamics. We assume constant F and g.
+    """
+    v1 = s1[1]
+    v2 = s2[1]
+    x1 = s1[0]
+    estimated_amplitude = (v1 - v2 + F * (a - 1)) / (g * np.cos(3 * x1))
+    return estimated_amplitude
+
+
+def probe_amplitude(env: gym.Env, action: int = 2) -> float:
+    """
+    One-step probe of a mountain car environment: resets, takes ``action`` once and
+    inverts the known dynamics to estimate the path amplitude. Steps a second time if
+    the start position sits on a cos(3x) zero, where the estimator is undefined.
+    """
+    state0, _ = env.reset()
+    state1, _, _, _, _ = env.step(action)
+    if np.isclose(np.cos(3 * state0[0]), 0.0):
+        # Avoid using a zero point in the amplitude estimator
+        state0 = state1
+        state1, _, _, _, _ = env.step(action)
+    return amplitude_estimator(state0, state1, action, F=env.force)
+
+
 #----- COIN interface helpers -----
 
 def coin_context_vector(
@@ -538,15 +567,15 @@ class COINQLearningAgent:
         self.position_bins = np.linspace(self.position_min, self.position_max, self.num_position_bins)
         self.velocity_bins = np.linspace(self.velocity_min, self.velocity_max, self.num_velocity_bins)
 
-        # Initialize Q-table database (append one extra for the novel context)
+        # Initialize Q-table database as one stacked array (append one extra for the novel context)
         n_actions = env.action_space.n
         if init_Q_random:
-            self.Qdat = [np.random.uniform(
-                low=-2, high=0, size=(self.num_position_bins, self.num_velocity_bins, n_actions)
-            ) for _ in range(max_contexts + 1)]
+            self.Qdat = np.random.uniform(
+                low=-2, high=0,
+                size=(max_contexts + 1, self.num_position_bins, self.num_velocity_bins, n_actions)
+            )
         else:
-            self.Qdat = [np.zeros((self.num_position_bins, self.num_velocity_bins, n_actions))
-                         for _ in range(max_contexts + 1)]
+            self.Qdat = np.zeros((max_contexts + 1, self.num_position_bins, self.num_velocity_bins, n_actions))
 
         # Track which contexts have been initialised - only novel initialised initially
         self.context_init = np.zeros((max_contexts + 1,))
@@ -603,13 +632,13 @@ class COINQLearningAgent:
 
     # -------- Policy & Learning --------
 
-    def choose_action(self, env: gym.Env, Q: np.ndarray, state: Tuple[int, int], eps: float) -> int:
+    def choose_action(self, env: gym.Env, q_row: np.ndarray, eps: float) -> int:
         """
         Choose an action using the configured exploration strategy.
+        'q_row' holds the averaged Q-values at the current state.
         For ε-greedy, 'eps' overrides the strategy's epsilon to support per-context averaging.
         For other strategies, 'eps' is ignored.
         """
-        q_row = Q[state]
         epsilon_override = eps if isinstance(self.strategy, EpsilonGreedy) else None
         return self.strategy.select_action(
             q_row,
@@ -620,24 +649,27 @@ class COINQLearningAgent:
 
     def update_q_table(
         self,
-        Qavg: np.ndarray,
+        td_error: float,
         state: Tuple[int, int],
         action: int,
         reward: float,
         next_state: Tuple[int, int],
-        p_context: np.ndarray
+        p_context: np.ndarray,
+        Z: float = None,
+        idx: np.ndarray = None,
     ) -> None:
         """
         Update the Q-tables using the COIN Q-learning update rule.
+        'td_error' is computed by the caller from the averaged Q-values; 'Z' and
+        'idx' may be precomputed once per episode since p_context is fixed.
         """
-        best_next_action = np.argmax(Qavg[next_state])
-        Z = np.nansum(p_context ** 2)  # normalizing constant for learning rates
-        for i in range(len(self.Qdat)):
-            if self.context_init[i] and not np.isnan(p_context[i]):
-                td_target = reward + self.gamma * Qavg[next_state][best_next_action]
-                td_error = td_target - Qavg[state][action]
-                p = float(p_context[i])
-                self.Qdat[i][state][action] += p * self.alpha * td_error / max(Z, 1e-8)
+        if Z is None:
+            Z = np.nansum(p_context ** 2)  # normalizing constant for learning rates
+        if idx is None:
+            # Zero-probability contexts receive a zero update, so only touch the rest
+            # (NaN entries compare False here, matching the previous per-context skip)
+            idx = np.flatnonzero((self.context_init > 0) & (p_context > 0))
+        self.Qdat[idx, state[0], state[1], action] += p_context[idx] * self.alpha * td_error / max(Z, 1e-8)
 
     def _pad_p_context(self, p_context: np.ndarray) -> np.ndarray:
         """Pad a shorter (C+1,) vector to (max_contexts+1,), keeping novel last."""
@@ -645,6 +677,19 @@ class COINQLearningAgent:
             pad = np.full(len(self.context_init) - p_context.shape[0], np.nan)
             p_context = np.concatenate([p_context[:-1], pad, p_context[-1:]])
         return p_context
+
+    def _averaged_q(
+        self,
+        state: Tuple[int, int],
+        probs: np.ndarray,
+        idx: np.ndarray,
+        average_bias: np.ndarray = None,
+    ) -> np.ndarray:
+        """Averaged Q-values at a single state, weighted over the contexts in 'idx'."""
+        q_row = probs[idx] @ self.Qdat[idx, state[0], state[1], :]
+        if average_bias is not None:
+            q_row = q_row + average_bias[state]
+        return q_row
 
     def instantiate_context_Q(
         self,
@@ -697,33 +742,39 @@ class COINQLearningAgent:
                 self.instantiate_context_Q(i, probs=instant_probs)
                 self.context_init[i] = 1
 
-        for _ in range(max_steps_per_episode):
-            # If "avoid_novel" is True, attempt to ignore novel context for action selection
-            action_probs = p_context.copy()
-            if self.avoid_novel and np.nansum(action_probs[:-1]) > 0:
-                action_probs[:-1] = action_probs[:-1] / np.nansum(action_probs[:-1])
-                action_probs[-1] = 0.0
+        # If "avoid_novel" is True, attempt to ignore novel context for action selection
+        action_probs = p_context.copy()
+        if self.avoid_novel and np.nansum(action_probs[:-1]) > 0:
+            action_probs[:-1] = action_probs[:-1] / np.nansum(action_probs[:-1])
+            action_probs[-1] = 0.0
 
-            # Compute averaged Q and averaged epsilon (for ε-greedy only)
-            if average_bias is None:
-                Qavg = np.zeros_like(self.Qdat[0])
-            else:
-                Qavg = average_bias.copy()
-            epsavg = 0.0
-            for i in range(len(self.Qdat)):
-                if self.context_init[i] and not np.isnan(action_probs[i]):
-                    Qavg += action_probs[i] * self.Qdat[i]
-                    # context epsilon (ε-greedy only); for novel (index == last), use max_epsilon
-                    ctx_eps = self.epsdat[i] if i < len(self.epsdat) else self.max_epsilon
-                    epsavg += action_probs[i] * ctx_eps
+        # Contexts that contribute to the average / receive updates, and the
+        # learning-rate normaliser; all fixed within the episode
+        avg_idx = np.flatnonzero((self.context_init > 0) & (action_probs > 0))
+        upd_idx = np.flatnonzero((self.context_init > 0) & (p_context > 0))
+        Z = np.nansum(p_context ** 2)
+
+        # Compute averaged epsilon (for ε-greedy only); fixed within the episode
+        epsavg = 0.0
+        for i in range(len(self.Qdat)):
+            if self.context_init[i] and not np.isnan(action_probs[i]):
+                # context epsilon (ε-greedy only); for novel (index == last), use max_epsilon
+                ctx_eps = self.epsdat[i] if i < len(self.epsdat) else self.max_epsilon
+                epsavg += action_probs[i] * ctx_eps
+
+        for _ in range(max_steps_per_episode):
+            # Averaged Q-values at the current state (the full averaged table is never needed)
+            q_row = self._averaged_q(state, action_probs, avg_idx, average_bias)
 
             # Choose action via the pluggable strategy
-            action = self.choose_action(env, Qavg, state, epsavg)
+            action = self.choose_action(env, q_row, epsavg)
 
             # Step and update
             next_obs, reward, done, truncated, _ = env.step(action)
             next_state = discretize_state(next_obs, self.position_bins, self.velocity_bins)
-            self.update_q_table(Qavg, state, action, reward, next_state, p_context)
+            next_q_row = self._averaged_q(next_state, action_probs, avg_idx, average_bias)
+            td_error = reward + self.gamma * np.max(next_q_row) - q_row[action]
+            self.update_q_table(td_error, state, action, reward, next_state, p_context, Z=Z, idx=upd_idx)
 
             state = next_state
             episode_reward += reward
@@ -768,23 +819,18 @@ class COINQLearningAgent:
             p_context[:-1] = p_context[:-1] / (np.nansum(p_context[:-1]) + 1e-4)
             p_context[-1] = 0.0
 
+        # Contexts that actually contribute to the average
+        idx = np.flatnonzero((self.context_init > 0) & (p_context > 0))
+
         for _ in range(n_episodes):
             obs, _ = env.reset()
             state = discretize_state(obs, self.position_bins, self.velocity_bins)
             episode_reward = 0.0
 
             for _ in range(max_steps_per_episode):
-                # Build averaged Q over contexts
-                if average_bias is None:
-                    Qavg = np.zeros_like(self.Qdat[0])
-                else:
-                    Qavg = average_bias.copy()
-                for i in range(len(self.Qdat)):
-                    if self.context_init[i] and not np.isnan(p_context[i]):
-                        Qavg += p_context[i] * self.Qdat[i]
-
                 # Greedy evaluation independent of exploration strategy
-                action = int(np.argmax(Qavg[state]))
+                q_row = self._averaged_q(state, p_context, idx, average_bias)
+                action = int(np.argmax(q_row))
                 next_obs, reward, done, truncated, _ = env.step(action)
                 next_state = discretize_state(next_obs, self.position_bins, self.velocity_bins)
 
@@ -879,12 +925,14 @@ class EmbodiedCOINQLearningAgent(COINQLearningAgent):
 
     def update_q_table(
         self,
-        Qavg: np.ndarray,
+        td_error: float,
         state: Tuple[int, int],
         action: int,
         reward: float,
         next_state: Tuple[int, int],
-        p_context: np.ndarray
+        p_context: np.ndarray,
+        Z: float = None,
+        idx: np.ndarray = None,
     ) -> None:
         """
         Update the Q-tables using the Embodied COIN Q-learning update rules.
@@ -897,12 +945,12 @@ class EmbodiedCOINQLearningAgent(COINQLearningAgent):
         self.Qbody[state][action] += self.alpha_body * td_error_body
 
         # Head updates
-        super().update_q_table(Qavg, state, action, reward, next_state, p_context)
+        super().update_q_table(td_error, state, action, reward, next_state, p_context, Z=Z, idx=idx)
 
-        # Body inhibition on head values
-        for i in range(len(self.Qdat)):
-            if self.context_init[i] and not np.isnan(p_context[i]):
-                self.Qdat[i][state][action] -= self.alpha_body * td_error_body
+        # Body inhibition on head values (applies to every instantiated context,
+        # not only those with nonzero probability)
+        idx = np.flatnonzero((self.context_init > 0) & ~np.isnan(p_context))
+        self.Qdat[idx, state[0], state[1], action] -= self.alpha_body * td_error_body
 
     def train_step(
         self,
