@@ -146,6 +146,47 @@ def coin_context_trace(
                      for t in range(len(ks))])
 
 
+def coin_predicted_pi(coin, cue=None) -> Tuple[np.ndarray, int]:
+    """
+    One-step-ahead predicted context probabilities of a ``RealTimeCOIN`` model.
+
+    ``predicted_context_probabilities_vector()`` is NOT the query you want here: it reports
+    ``D.predicted_probabilities``, which ``observe_y`` writes as its first step, so it is one
+    trial STALE and ignores the cue just staged by ``observe_q``. This helper instead
+    propagates the current particle state one trial forward, relabels it into the aligned
+    global frame and averages over the modal particles -- exactly what COIN's own aligned
+    query does, but for the trial about to happen.
+
+    **Call timing is a contract:** call immediately after ``observe_q``, before anything else
+    touches the model. ``realtimecoin`` is imported here, not at module scope, so ``rl.py``
+    stays importable without it.
+
+    Args:
+        coin: A ``RealTimeCOIN`` model.
+        cue: Raw cue value for the upcoming trial, or None to marginalise the cue out.
+
+    Returns:
+        Tuple[np.ndarray, int]: A ``(max_contexts + 1,)`` probability vector in the global
+        frame (known contexts ``0 .. K-1``, novel at ``K``, padding zeros above) and ``K``.
+    """
+    from realtimecoin.alignment import global_context_weights
+    from realtimecoin.context import next_trial_context_weights
+    from realtimecoin.numerics import renormalize_global_weights
+    from realtimecoin.state import peek_cue_label
+
+    q = peek_cue_label(coin, cue)
+    if q is not None and q >= len(coin.cue_values):
+        # An unregistered cue: next_trial_context_weights would CLAMP the label to the last
+        # existing column, whereas observe_y registers the cue and grows the matrix first.
+        # Marginalising is the only honest option before the fact.
+        q = None
+
+    align = coin.context_alignment()
+    w = next_trial_context_weights(coin, q)              # (P, C), local labels
+    g = global_context_weights(coin, w, align)           # (P_modal, C), global labels
+    return renormalize_global_weights(np.mean(g, axis=0)), int(align["K"])
+
+
 def _as_context_probs_fn(context_probs):
     """Accept either a callable episode -> probs, or a constant (N,) array."""
     if callable(context_probs):
@@ -2487,3 +2528,440 @@ class COINPPOAgent(PPOAgent):
                 rewards.append(ep_ret)
 
         return rewards
+
+
+#----- Amortised COIN PPO -----
+
+class ContingencyEncoder(nn.Module):
+    """
+    PEARL-style amortised posterior ``q_phi(z | h)`` over a scalar latent contingency.
+
+    A shared MLP maps every transition ``(s, a, r, s')`` to its own Gaussian factor; the
+    posterior is their product, held in natural parameters so every *prefix* posterior is a
+    running sum -- one ``cumsum`` per segment. Means are ``z_scale * tanh(.)``, so the sample
+    cannot leave COIN's dynamic range. ``prior_sd`` is both the ``k = 0`` posterior and the
+    KL reference.
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int, action_continuous: bool, hidden: int = 64,
+                 z_scale: float = 0.15, prior_sd: float = 1.0, sigma_min: float = 0.05,
+                 sigma_max: float = 20.0):
+        super().__init__()
+        self.obs_dim, self.act_dim = int(obs_dim), int(act_dim)
+        self.action_continuous = bool(action_continuous)
+        self.z_scale, self.prior_sd = float(z_scale), float(prior_sd)
+        self.log_sigma_min, self.log_sigma_max = float(np.log(sigma_min)), float(np.log(sigma_max))
+        self.in_dim = 2 * self.obs_dim + self.act_dim + 1          # (s, a_repr, r, s')
+        self.net = _MLP(self.in_dim, 2, hidden)
+
+        # A zero final layer makes every mu_t exactly zero at initialisation, so an untrained
+        # encoder emits a constant z and buys COIN no spurious contexts. The dynamics
+        # gradient survives it, because tanh'(0) = 1.
+        last = self.net.net[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+        with torch.no_grad():
+            last.bias[1] = 1.0    # sigma ~ 2.72: uninformative, well inside the clamps
+
+    def transition_features(self, obs, act, rew, next_obs) -> torch.Tensor:
+        """``[T, in_dim]`` inputs ``concat(s, a_repr, r, s')``; ``next_obs`` is the post-step
+        observation, captured before any episode reset."""
+        dev = next(self.parameters()).device
+        obs = obs.to(device=dev, dtype=torch.float32).view(-1, self.obs_dim)
+        next_obs = next_obs.to(device=dev, dtype=torch.float32).view(-1, self.obs_dim)
+        rew = rew.to(device=dev, dtype=torch.float32).view(-1, 1)
+        if self.action_continuous:
+            act_repr = act.to(device=dev, dtype=torch.float32).view(-1, self.act_dim)
+        else:
+            idx = act.to(device=dev).long().view(-1)
+            act_repr = torch.nn.functional.one_hot(idx, self.act_dim).float()
+        return torch.cat([obs, act_repr, rew, next_obs], dim=-1)
+
+    def factors(self, feats: torch.Tensor):
+        """Per-transition Gaussian factors ``mu[T]``, ``sigma[T]``."""
+        out = self.net(feats)
+        log_sigma = out[..., 1].clamp(self.log_sigma_min, self.log_sigma_max)
+        return self.z_scale * torch.tanh(out[..., 0]), torch.exp(log_sigma)
+
+    def prefix_posterior(self, feats: torch.Tensor, seg_len: int):
+        """
+        Prefix posteriors over ``z`` for segment-major ``feats`` ``[S * seg_len, in_dim]``.
+
+        Accumulating the natural parameters with a ``cumsum`` along an ``[S, seg_len]`` view
+        makes cross-segment leakage structurally impossible: the posterior RESTARTS at every
+        boundary. The prior precision is added after the cumsum, never inside it, so column 0
+        of every row is exactly the prior. Returns ``mean``/``sd`` ``[S, seg_len + 1]``,
+        column ``k`` being the posterior after ``k`` transitions; segments must be equal
+        length.
+        """
+        seg_len = int(seg_len)
+        if feats.shape[0] % seg_len:
+            raise ValueError(f"{feats.shape[0]} transitions is not a multiple of {seg_len}.")
+        mu, sigma = self.factors(feats)
+        inv_var = 1.0 / (sigma * sigma)
+        eta2, eta1 = inv_var.view(-1, seg_len), (mu * inv_var).view(-1, seg_len)
+        zero = eta2.new_zeros(eta2.shape[0], 1)
+        sum2 = torch.cat([zero, eta2.cumsum(dim=1)], dim=1)
+        sum1 = torch.cat([zero, eta1.cumsum(dim=1)], dim=1)
+        var = 1.0 / (sum2 + 1.0 / (self.prior_sd ** 2))
+        return sum1 * var, torch.sqrt(var)
+
+
+class AmortisedCOINPPOAgent(COINPPOAgent):
+    """
+    COIN-PPO whose context observation is inferred, not supplied.
+
+    A :class:`ContingencyEncoder` compresses a segment's transitions into a posterior over a
+    scalar latent contingency ``z``; a decoder ``f_psi(s, a, z) -> s'`` gives that latent
+    something to mean. Encoder and decoder are trained together on
+    ``L_dyn (MSE) + kl_coef * KL(q || N(0, prior_sd^2))`` -- a self-supervised objective that
+    has a gradient from the first step, unlike the value-based training it replaces (there
+    the PPO loss reached ``phi`` only through a differentiable responsibility, whose
+    derivative is identically zero whenever the context heads agree, which is exactly the
+    case at onset and at every context instantiation, since new heads are deep copies).
+
+    ``z`` is therefore stop-gradiented out of PPO entirely. COIN sits in the loop but is
+    never differentiated through: the agent acts on COIN's one-step-ahead predicted context
+    probabilities (constant for a segment), and COIN observes the segment-final posterior
+    mean of ``z``. Responsibilities are diagnostics only.
+
+    **One rollout is S contiguous fixed-length segments, each a different task and its own
+    COIN trial** (see :meth:`train_step`). Interleaving the tasks is what forces ``z`` to be
+    informative: with one task per rollout a constant ``z`` predicts the dynamics just as
+    well, whereas across interleaved tasks a single decoder cannot fit contradictory
+    dynamics unless ``z`` splits them.
+
+    Args:
+        encoder_hidden (int): Hidden width of both the encoder and the decoder MLP.
+        z_scale (float): Bound on ``|mu_t|``, i.e. COIN's dynamic range for the latent.
+        prior_sd (float): Prior sd, used both as the empty-prefix posterior and as the KL
+            reference.
+        avoid_novel (bool): Drop the novel column from the acting weights whenever the known
+            contexts carry mass; see :meth:`_policy_weights`.
+        kl_coef (float): Weight of the KL term in the encoder objective.
+        **kwargs: Forwarded to :class:`COINPPOAgent`.
+    """
+
+    def __init__(self, env: gym.Env, ctx_ids: dict, encoder_hidden: int = 64,
+                 encoder_lr: float = 3e-4, enc_grad_clip: Optional[float] = 1.0,
+                 z_scale: float = 0.15, prior_sd: float = 1.0, avoid_novel: bool = True,
+                 kl_coef: float = 1e-3, **kwargs):
+        super().__init__(env, ctx_ids, **kwargs)
+        self.z_scale, self.prior_sd = float(z_scale), float(prior_sd)
+        self.avoid_novel, self.kl_coef = bool(avoid_novel), float(kl_coef)
+        self.enc_grad_clip = enc_grad_clip
+        self.encoder = ContingencyEncoder(
+            self.obs_dim, self.act_dim, self.action_continuous, hidden=encoder_hidden,
+            z_scale=z_scale, prior_sd=prior_sd).to(self.device)
+        self.decoder = _MLP(self.obs_dim + self.act_dim + 1, self.obs_dim,
+                            encoder_hidden).to(self.device)
+        # Deliberately NOT in self._all_optimizers(): the encoder is trained by the dynamics
+        # objective alone, and the PPO step must not touch it.
+        self.enc_optim = optim.Adam(
+            list(self.encoder.parameters()) + list(self.decoder.parameters()), lr=encoder_lr)
+
+    # ------------------------------------------------------------------
+    # Small pieces
+    # ------------------------------------------------------------------
+    def ensure_contexts(self, K: int) -> None:
+        """
+        Instantiate a head for every aligned global context COIN holds. Keyed on the
+        alignment ``K``, not on ``pi > 0``: a context with negligible predicted probability
+        can still take responsibility later, and ``_mixed_logits``/``_mixed_value`` silently
+        drop the mass of an uninstantiated head.
+        """
+        for j in range(min(int(K), self.num_contexts - 1)):
+            cid = self.context_keys[j]
+            if self.context_init.get(cid, 0) == 0:
+                self._instantiate_context_net(cid)
+
+    def _policy_weights(self, pi_agent) -> torch.Tensor:
+        """
+        Turn one agent-layout context vector into acting weights ``[num_contexts]``.
+
+        Not differentiable and not meant to be -- these are COIN's own probabilities. NaN
+        padding (uninstantiated slots) becomes zero before it can reach the ``_mixed_*``
+        helpers, which do no sanitising of their own. With ``avoid_novel`` the novel column
+        is dropped and the known contexts renormalised, EXCEPT when the known mass is
+        negligible (trial 0, where ``K = 0`` puts everything on novel) -- dropping it there
+        would leave an all-zero weight vector.
+        """
+        w = np.nan_to_num(np.asarray(pi_agent, dtype=np.float64), nan=0.0)
+        if self.avoid_novel and w[:-1].sum() > 1e-6:
+            w = np.concatenate([w[:-1] / w[:-1].sum(), [0.0]])
+        return torch.as_tensor(w, dtype=torch.float32, device=self.device)
+
+    def _logp_entropy(self, obs: torch.Tensor, act: torch.Tensor, w: torch.Tensor):
+        """``log pi(act | obs)`` and mean entropy under the context-mixed heads."""
+        if self.action_continuous:
+            dist = torch.distributions.Normal(*self._mixed_gaussian(obs, w))
+            return dist.log_prob(act).sum(-1), dist.entropy().sum(-1).mean()
+        dist = torch.distributions.Categorical(logits=self._mixed_logits(obs, w))
+        return dist.log_prob(act), dist.entropy().mean()
+
+    def _kl_to_prior(self, mean: torch.Tensor, sd: torch.Tensor) -> torch.Tensor:
+        """``KL(N(mean, sd^2) || N(0, prior_sd^2))``, elementwise."""
+        p2 = self.prior_sd ** 2
+        return np.log(self.prior_sd) - torch.log(sd) + (sd * sd + mean * mean) / (2.0 * p2) - 0.5
+
+    def _decode_next_obs(self, feats: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """Predicted ``s'`` from ``(s, a_repr, z)``. The reward column is deliberately left
+        out: only the state transition carries the contingency."""
+        return self.decoder(torch.cat([feats[:, :self.obs_dim + self.act_dim],
+                                       z.unsqueeze(-1)], dim=-1))
+
+    def _segment_features(self, obs, act, rew, next_obs) -> torch.Tensor:
+        """Stack one segment's stored transitions into encoder features ``[L, in_dim]``."""
+        act_t = torch.stack([torch.as_tensor(a) for a in act])
+        act_t = act_t.float() if self.action_continuous else act_t.long()
+        return self.encoder.transition_features(
+            torch.stack(obs), act_t, torch.as_tensor(rew, dtype=torch.float32),
+            torch.stack(next_obs))
+
+    # ------------------------------------------------------------------
+    # Encoder / decoder training
+    # ------------------------------------------------------------------
+    def _update_encoder(self, feats: torch.Tensor, seg_len: int, mini_epochs: int,
+                        mb_size: int) -> Dict[str, float]:
+        """
+        Fit encoder and decoder on ``L_dyn + kl_coef * KL``, minibatched over transitions.
+
+        The posterior is recomputed from scratch every optimizer step (it depends on all
+        parameters, so a cached one would go stale immediately) and resampled with fresh
+        noise. Prefix column ``t`` is the posterior BEFORE transition ``t``, so the latent
+        the decoder sees never contains the transition it has to predict.
+        """
+        n = feats.shape[0]
+        obs_dim = self.obs_dim
+        clip = float("inf") if self.enc_grad_clip is None else float(self.enc_grad_clip)
+        dyn_val = kl_val = grad_norm = float("nan")
+
+        for _ in range(mini_epochs):
+            idxs = torch.randperm(n)
+            for start in range(0, n, mb_size):
+                mb = idxs[start:start + mb_size]
+                mean, sd = self.encoder.prefix_posterior(feats, seg_len)
+                z = (mean[:, :-1] + torch.randn_like(sd[:, :-1]) * sd[:, :-1]).reshape(-1)
+
+                dyn = (self._decode_next_obs(feats[mb], z[mb])
+                       - feats[mb, -obs_dim:]).pow(2).mean()
+                kl = self._kl_to_prior(mean, sd).mean()
+                loss = dyn + self.kl_coef * kl
+
+                self.enc_optim.zero_grad()
+                loss.backward()
+                grad_norm = float(nn.utils.clip_grad_norm_(self.encoder.parameters(), clip))
+                self.enc_optim.step()
+                dyn_val, kl_val = float(dyn.item()), float(kl.item())
+
+        return {"dyn_loss": dyn_val, "encoder_kl": kl_val, "enc_grad_norm": grad_norm}
+
+    def pretrain_encoder(self, envs, seg_steps: int = 512, n_iters: int = 50,
+                         mini_epochs: int = 10, mb_size: int = 64) -> Dict[str, np.ndarray]:
+        """
+        Train encoder and decoder on uniform-random rollouts, with no COIN and no PPO.
+
+        The pretrain-then-RL regime: a latent learned before any policy exists, then frozen
+        while the RL model trains online (``train_step(..., update_encoder=False)``). Random
+        actions are the standard choice for dynamics pretraining -- they excite the
+        transition model broadly, and the contingency signature is in the transitions, not
+        in the returns. Pass one FRESH env per segment, as for :meth:`train_step`.
+
+        Returns:
+            Dict[str, np.ndarray]: Per-iteration ``dyn_loss``, ``encoder_kl`` and
+            ``enc_grad_norm``.
+        """
+        L = int(seg_steps)
+        history: Dict[str, List[float]] = defaultdict(list)
+
+        for _ in range(n_iters):
+            seg_feats = []
+            for env in envs:
+                obs_t = self._flatten_obs(env.reset()[0])
+                obs, act, rew, nxt = [], [], [], []
+                for _ in range(L):
+                    action = env.action_space.sample()
+                    next_obs, reward, done, trunc, _ = env.step(action)
+                    obs.append(obs_t.cpu())
+                    act.append(action)
+                    nxt.append(self._flatten_obs(next_obs).cpu())
+                    rew.append(float(reward))
+                    if done or trunc:
+                        next_obs, _ = env.reset()
+                    obs_t = self._flatten_obs(next_obs)
+                seg_feats.append(self._segment_features(obs, act, rew, nxt))
+
+            for key, val in self._update_encoder(
+                    torch.cat(seg_feats), L, mini_epochs, mb_size).items():
+                history[key].append(val)
+
+        return {k: np.asarray(v, dtype=float) for k, v in history.items()}
+
+    # ------------------------------------------------------------------
+    # Training step
+    # ------------------------------------------------------------------
+    def train_step(self, envs, coin, seg_steps: int = 512, mini_epochs: int = 10,
+                   mb_size: int = 64, cues=None, update_encoder: bool = True):
+        """
+        Collect one segment-interleaved rollout and update on it.
+
+        One call is ``S = len(envs)`` contiguous segments of ``seg_steps`` transitions, each
+        a different task and its own COIN trial, so this method drives ``coin`` itself
+        (``observe_q`` -> predicted pi -> segment -> ``observe_y``, advancing ``S`` trials).
+        ``S = 1`` reproduces one task per rollout. Pass one FRESH env per segment --
+        ``CustomCartPoleEnv.__init__`` computes its derived constants once, so mutating a
+        live env leaves them stale -- and optionally one ``cues`` entry per segment.
+
+        Args:
+            update_encoder (bool): False freezes encoder and decoder and reports their
+                losses under ``no_grad`` only. With a pretrained encoder that reduces this
+                to the plain COIN-PPO routine with COIN stepped inside.
+
+        Returns:
+            dict: Per-segment arrays ``z``, ``z_sd``, ``K`` (pre-observation), ``pi``
+            ``[S, W]``, ``rho`` ``[S, W]`` (post-observation diagnostics),
+            ``mean_episode_return``, plus scalar ``mean_reward_per_step``, ``value_loss``,
+            ``policy_loss``, ``dyn_loss``, ``encoder_kl``, ``enc_grad_norm``.
+        """
+        S, L = len(envs), int(seg_steps)
+        enc, W = self.encoder, self.num_contexts
+        store: Dict[str, List[Any]] = defaultdict(list)
+        seg_feats, seg_w, seg_last_obs, seg_returns = [], [], [], []
+        seg_z, seg_z_sd, seg_K, seg_pi, seg_rho = [], [], [], [], []
+
+        # ---------- 1. interleaved rollout ----------
+        for s, env in enumerate(envs):
+            cue = None if cues is None else cues[s]
+            coin.observe_q(cue)
+            # Never predicted_context_probabilities_vector() here: it is one trial stale and
+            # ignores the cue just staged. Query strictly before anything else touches coin.
+            pi_vec, K = coin_predicted_pi(coin, cue)
+            self.ensure_contexts(K)
+            # min(K, W - 1) keeps coin_context_vector in range; renormalise_novel folds any
+            # overflow mass (more COIN contexts than heads) into the novel column.
+            pi_agent = coin_context_vector(pi_vec, min(K, W - 1), width=W)
+            w_s = self._policy_weights(pi_agent)      # CONSTANT for the whole segment
+            seg_K.append(K)
+            seg_pi.append(pi_agent)
+            seg_w.append(w_s)
+
+            obs_t = self._flatten_obs(env.reset()[0])
+            obs, act, rew, nxt = [], [], [], []
+            ep_returns, ep_ret = [], 0.0
+
+            for _ in range(L):
+                with torch.no_grad():
+                    value = self._mixed_value(obs_t.unsqueeze(0), w_s)[0].item()
+                    action_np, logp, _, _ = self.act(obs_t, w_s)
+                next_obs, reward, done, trunc, _ = env.step(action_np)
+
+                # next_obs is stored BEFORE any reset: letting the reset overwrite it
+                # corrupts every episode-final transition with no visible symptom.
+                obs.append(obs_t.cpu())
+                act.append(action_np)
+                nxt.append(self._flatten_obs(next_obs).cpu())
+                rew.append(float(reward))
+                store["logp"].append(logp.cpu())
+                store["val"].append(value)
+                store["done"].append(bool(done or trunc))
+
+                ep_ret += reward
+                if done or trunc:
+                    next_obs, _ = env.reset()
+                    ep_returns.append(ep_ret)
+                    ep_ret = 0.0
+                obs_t = self._flatten_obs(next_obs)
+
+            store["obs"] += obs
+            store["act"] += act
+            store["rew"] += rew
+            feats_s = self._segment_features(obs, act, rew, nxt)
+            seg_feats.append(feats_s)
+            seg_last_obs.append(obs_t)
+            seg_returns.append(float(np.mean(ep_returns)) if ep_returns else 0.0)
+
+            with torch.no_grad():
+                mean_s, sd_s = enc.prefix_posterior(feats_s, L)
+            seg_z.append(float(mean_s[0, -1]))
+            seg_z_sd.append(float(sd_s[0, -1]))
+            coin.observe_y(float(mean_s[0, -1]))       # plain float: COIN works in float64
+
+            # Post-observation diagnostics; K may have grown, so re-query the alignment.
+            K_post = int(coin.context_alignment()["K"])
+            seg_rho.append(coin_context_vector(coin.responsibilities_vector(),
+                                               min(K_post, W - 1), width=W,
+                                               renormalise_novel=False))
+
+        # ---------- 2. tensors and advantages ----------
+        obs_tensor = torch.stack(store["obs"]).to(self.device)
+        act_tensor = torch.stack([torch.as_tensor(a) for a in store["act"]]).to(self.device)
+        act_tensor = act_tensor.float() if self.action_continuous else act_tensor.long()
+        old_logp = torch.stack(store["logp"]).to(self.device).float()
+        feats = torch.cat(seg_feats)
+        w_all = torch.stack(seg_w).repeat_interleave(L, dim=0)          # [S * L, W]
+
+        adv_parts, ret_parts = [], []
+        with torch.no_grad():
+            for s in range(S):
+                sl = slice(s * L, (s + 1) * L)
+                last_val = self._mixed_value(seg_last_obs[s].unsqueeze(0), seg_w[s])[0].item()
+                # GAE never crosses a task boundary: each segment bootstraps on its own.
+                a, r = self._compute_advantages(
+                    store["rew"][sl], store["val"][sl], store["done"][sl], last_val)
+                adv_parts.append(a)
+                ret_parts.append(r)
+
+        # Normalise across the WHOLE rollout, not per segment. Per-segment normalisation was
+        # measured and is a REGRESSION: equalising the segments' advantage scales removes the
+        # asymmetry that lets one task break away, and without a leader neither separates.
+        adv = torch.cat(adv_parts)
+        adv_tensor = ((adv - adv.mean()) / (adv.std() + 1e-8)).to(self.device).float()
+        ret_tensor = torch.cat(ret_parts).to(self.device).float()
+
+        # ---------- 3. PPO update (context heads only) ----------
+        n = S * L
+        actor_loss = critic_loss = None
+        for _ in range(mini_epochs):
+            idxs = torch.randperm(n)
+            for start in range(0, n, mb_size):
+                mb = idxs[start:start + mb_size]
+                b_obs, b_act, b_w = obs_tensor[mb], act_tensor[mb], w_all[mb]
+
+                new_logp, entropy = self._logp_entropy(b_obs, b_act, b_w)
+                ratio = torch.exp(new_logp - old_logp[mb])
+                surr = torch.min(
+                    ratio * adv_tensor[mb],
+                    torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_tensor[mb])
+                actor_loss = -surr.mean()
+                critic_loss = (ret_tensor[mb] - self._mixed_value(b_obs, b_w)).pow(2).mean()
+                loss = actor_loss + self.vf_coef * critic_loss - self.ent_coef * entropy
+
+                for opt in self._all_optimizers():
+                    opt.zero_grad()
+                loss.backward()
+                for opt in self._all_optimizers():
+                    opt.step()
+
+        # ---------- 4. encoder + decoder update ----------
+        if update_encoder:
+            enc_stats = self._update_encoder(feats, L, mini_epochs, mb_size)
+        else:
+            with torch.no_grad():
+                mean, sd = enc.prefix_posterior(feats, L)
+                z = (mean[:, :-1] + torch.randn_like(sd[:, :-1]) * sd[:, :-1]).reshape(-1)
+                dyn = (self._decode_next_obs(feats, z) - feats[:, -self.obs_dim:]).pow(2).mean()
+                enc_stats = {"dyn_loss": float(dyn.item()),
+                             "encoder_kl": float(self._kl_to_prior(mean, sd).mean().item()),
+                             "enc_grad_norm": 0.0}
+
+        # ---------- 5. diagnostics ----------
+        self._weights_version += 1
+        return {
+            "z": np.asarray(seg_z, dtype=float), "z_sd": np.asarray(seg_z_sd, dtype=float),
+            "K": np.asarray(seg_K, dtype=int),
+            "pi": np.asarray(seg_pi, dtype=float), "rho": np.asarray(seg_rho, dtype=float),
+            "mean_episode_return": np.asarray(seg_returns, dtype=float),
+            "mean_reward_per_step": float(np.mean(store["rew"])),
+            "value_loss": float(critic_loss.item()), "policy_loss": float(actor_loss.item()),
+            **enc_stats,
+        }
