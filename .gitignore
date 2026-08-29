@@ -13,3 +13,7 @@
 
 # Local planning notes
 fig2_baselines_plan.md
+fig3_amortised_plan.md
+
+# Local backups
+*.bak

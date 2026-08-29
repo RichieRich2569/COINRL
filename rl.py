@@ -12,7 +12,7 @@ import gymnasium as gym
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Tuple, List, Optional, Union, Protocol, Dict, Any, runtime_checkable
 import copy
 
@@ -2607,6 +2607,36 @@ class ContingencyEncoder(nn.Module):
         return sum1 * var, torch.sqrt(var)
 
 
+class SegmentReplayBuffer:
+    """
+    FIFO pool of per-segment encoder features ``[L, in_dim]``, held on CPU.
+
+    The dynamics objective is off-policy, so old segments stay valid targets. Replaying
+    them decouples the encoder's training data from whatever tasks the latest rollout
+    happened to contain, which is what stops the latent from drifting with the curriculum.
+    Capacity is counted in SEGMENTS, since a prefix posterior is a whole-segment quantity.
+    """
+
+    def __init__(self, capacity: int = 128):
+        self.buffer: deque = deque(maxlen=int(capacity))
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+    def push(self, feats: torch.Tensor) -> None:
+        """Store one segment's features. A change of segment length empties the pool:
+        :meth:`ContingencyEncoder.prefix_posterior` needs one common length."""
+        feats = feats.detach().cpu()
+        if self.buffer and self.buffer[-1].shape[0] != feats.shape[0]:
+            self.buffer.clear()
+        self.buffer.append(feats)
+
+    def sample(self, n_segments: int) -> torch.Tensor:
+        """``[n * L, in_dim]``, segment-major, sampled uniformly without replacement."""
+        idx = torch.randperm(len(self.buffer))[:int(n_segments)]
+        return torch.cat([self.buffer[int(i)] for i in idx])
+
+
 class AmortisedCOINPPOAgent(COINPPOAgent):
     """
     COIN-PPO whose context observation is inferred, not supplied.
@@ -2629,7 +2659,9 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
     COIN trial** (see :meth:`train_step`). Interleaving the tasks is what forces ``z`` to be
     informative: with one task per rollout a constant ``z`` predicts the dynamics just as
     well, whereas across interleaved tasks a single decoder cannot fit contradictory
-    dynamics unless ``z`` splits them.
+    dynamics unless ``z`` splits them. The task switches at a boundary; the EPISODE does
+    not -- it is carried into the next segment, so a switch is a perturbation of an ongoing
+    episode rather than a fresh start.
 
     Args:
         encoder_hidden (int): Hidden width of both the encoder and the decoder MLP.
@@ -2638,14 +2670,18 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             reference.
         avoid_novel (bool): Drop the novel column from the acting weights whenever the known
             contexts carry mass; see :meth:`_policy_weights`.
-        kl_coef (float): Weight of the KL term in the encoder objective.
+        kl_coef (float): Weight of the KL term in the encoder objective. Keep it above zero:
+            :meth:`train_step` hands the posterior sd to COIN as sensory noise, and an
+            unpenalised sd is not calibrated.
+        replay_capacity (int): Size of the encoder's :class:`SegmentReplayBuffer`, in
+            segments.
         **kwargs: Forwarded to :class:`COINPPOAgent`.
     """
 
     def __init__(self, env: gym.Env, ctx_ids: dict, encoder_hidden: int = 64,
                  encoder_lr: float = 3e-4, enc_grad_clip: Optional[float] = 1.0,
                  z_scale: float = 0.15, prior_sd: float = 1.0, avoid_novel: bool = True,
-                 kl_coef: float = 1e-3, **kwargs):
+                 kl_coef: float = 1e-3, replay_capacity: int = 128, **kwargs):
         super().__init__(env, ctx_ids, **kwargs)
         self.z_scale, self.prior_sd = float(z_scale), float(prior_sd)
         self.avoid_novel, self.kl_coef = bool(avoid_novel), float(kl_coef)
@@ -2659,6 +2695,10 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         # objective alone, and the PPO step must not touch it.
         self.enc_optim = optim.Adam(
             list(self.encoder.parameters()) + list(self.decoder.parameters()), lr=encoder_lr)
+        self.replay = SegmentReplayBuffer(replay_capacity)
+        # The episode a segment stopped in, kept on the agent so a rollout boundary is no
+        # different from any other segment boundary. See :meth:`_start_segment`.
+        self._carry: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Small pieces
@@ -2718,46 +2758,112 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             torch.stack(obs), act_t, torch.as_tensor(rew, dtype=torch.float32),
             torch.stack(next_obs))
 
+    def reset_carry(self) -> None:
+        """Forget the carried episode, so the next segment starts from a plain reset."""
+        self._carry = None
+
+    def _segment_context_gaussians(self, coin, k: int):
+        """
+        Feedback-space Gaussians for the within-segment responsibility update, queried ONCE
+        per segment: ``(mean, var)`` for each of the ``k`` known contexts plus the novel
+        column last. Known contexts use COIN's aligned per-context estimates (feedback mean
+        = state + bias); novel uses the same stationary moments COIN re-seeds a fresh
+        context from, ``d/(1-a)`` and ``Q/(1-a^2)`` under the prior means. Observation
+        noise is NOT added here -- the caller supplies the encoder's sd per step.
+        """
+        proto = coin.context_alignment()["global_contexts"]
+        mu = (np.asarray(proto["state_mean"][:k], dtype=float)
+              + np.asarray(proto["bias_mean"][:k], dtype=float))
+        var = np.asarray(proto["state_var"][:k], dtype=float)
+        a0 = float(coin.prior_mean_retention)
+        nov_mu = float(coin.prior_mean_drift) / (1.0 - a0)
+        nov_var = float(coin.sigma_process_noise) ** 2 / (1.0 - a0 ** 2)
+        return np.append(mu, nov_mu), np.append(var, nov_var)
+
+    def _step_context_weights(self, pi_agent, z: float, sd: float,
+                              ctx_mu: np.ndarray, ctx_var: np.ndarray, floor2: float):
+        """
+        Within-segment responsibility update:
+        ``w(c) propto pi_pred(c) * N(z; mu_c, var_c + sd^2 + floor^2)``.
+
+        COIN is never touched here -- the predicted pi is reweighted by how well each
+        context's feedback Gaussian explains the encoder's CURRENT latent estimate. Early
+        in a segment ``sd`` is large, the likelihood is flat and the weights sit at the
+        prior; as evidence accumulates they sharpen toward the responsible context. Layout
+        in and out is the agent frame ``[known..., nan pad, novel last]``; ``ctx_mu`` /
+        ``ctx_var`` are ``[known..., novel]`` from :meth:`_segment_context_gaussians`.
+        """
+        w = np.asarray(pi_agent, dtype=float).copy()
+        k = len(ctx_mu) - 1
+        var = ctx_var + sd * sd + floor2
+        ll = -0.5 * ((z - ctx_mu) ** 2 / var + np.log(var))
+        like = np.exp(ll - ll.max())
+        w[:k] *= like[:k]
+        w[-1] *= like[-1]
+        total = np.nansum(w)
+        if not np.isfinite(total) or total <= 0.0:
+            return pi_agent          # degenerate likelihoods: fall back to the prior
+        return w / total
+
+    def _start_segment(self, env, carry_state: bool):
+        """
+        Start a segment in ``env``, continuing the previous segment's episode if there is
+        one. The task changes at a boundary, the episode does not: state and the time-limit
+        counter are copied into the fresh env after its own reset, which keeps the step
+        limit per EPISODE rather than per segment. Returns the starting observation and the
+        episode return so far.
+        """
+        obs, _ = env.reset()
+        carry = self._carry if carry_state else None
+        if carry is None:
+            return self._flatten_obs(obs), 0.0
+
+        env.state = np.array(carry["state"])
+        env._elapsed_steps = carry["elapsed"]
+        # CartPole's observation IS its state; envs that transform it expose a getter.
+        get_obs = getattr(env, "_get_obs", None) or getattr(env, "_get_ob", None)
+        obs = get_obs() if get_obs is not None else np.asarray(env.state, dtype=np.float32)
+        return self._flatten_obs(obs), carry["ep_ret"]
+
     # ------------------------------------------------------------------
     # Encoder / decoder training
     # ------------------------------------------------------------------
-    def _update_encoder(self, feats: torch.Tensor, seg_len: int, mini_epochs: int,
-                        mb_size: int) -> Dict[str, float]:
+    def _update_encoder(self, seg_len: int, enc_steps: int,
+                        mb_segments: int) -> Dict[str, float]:
         """
-        Fit encoder and decoder on ``L_dyn + kl_coef * KL``, minibatched over transitions.
+        Fit encoder and decoder on ``L_dyn + kl_coef * KL``, minibatched over SEGMENTS.
 
-        The posterior is recomputed from scratch every optimizer step (it depends on all
-        parameters, so a cached one would go stale immediately) and resampled with fresh
-        noise. Prefix column ``t`` is the posterior BEFORE transition ``t``, so the latent
-        the decoder sees never contains the transition it has to predict.
+        Each gradient step draws ``mb_segments`` segments from :attr:`replay` and uses all
+        of their transitions -- a prefix posterior is a whole-segment quantity, so a
+        minibatch of loose transitions would have to encode their segments in full anyway.
+        The posterior is recomputed from scratch every step (it depends on all parameters,
+        so a cached one would go stale immediately) and resampled with fresh noise. Prefix
+        column ``t`` is the posterior BEFORE transition ``t``, so the latent the decoder
+        sees never contains the transition it has to predict.
         """
-        n = feats.shape[0]
         obs_dim = self.obs_dim
         clip = float("inf") if self.enc_grad_clip is None else float(self.enc_grad_clip)
         dyn_val = kl_val = grad_norm = float("nan")
 
-        for _ in range(mini_epochs):
-            idxs = torch.randperm(n)
-            for start in range(0, n, mb_size):
-                mb = idxs[start:start + mb_size]
-                mean, sd = self.encoder.prefix_posterior(feats, seg_len)
-                z = (mean[:, :-1] + torch.randn_like(sd[:, :-1]) * sd[:, :-1]).reshape(-1)
+        for _ in range(int(enc_steps)):
+            feats = self.replay.sample(mb_segments).to(self.device)
+            mean, sd = self.encoder.prefix_posterior(feats, seg_len)
+            z = (mean[:, :-1] + torch.randn_like(sd[:, :-1]) * sd[:, :-1]).reshape(-1)
 
-                dyn = (self._decode_next_obs(feats[mb], z[mb])
-                       - feats[mb, -obs_dim:]).pow(2).mean()
-                kl = self._kl_to_prior(mean, sd).mean()
-                loss = dyn + self.kl_coef * kl
+            dyn = (self._decode_next_obs(feats, z) - feats[:, -obs_dim:]).pow(2).mean()
+            kl = self._kl_to_prior(mean, sd).mean()
+            loss = dyn + self.kl_coef * kl
 
-                self.enc_optim.zero_grad()
-                loss.backward()
-                grad_norm = float(nn.utils.clip_grad_norm_(self.encoder.parameters(), clip))
-                self.enc_optim.step()
-                dyn_val, kl_val = float(dyn.item()), float(kl.item())
+            self.enc_optim.zero_grad()
+            loss.backward()
+            grad_norm = float(nn.utils.clip_grad_norm_(self.encoder.parameters(), clip))
+            self.enc_optim.step()
+            dyn_val, kl_val = float(dyn.item()), float(kl.item())
 
         return {"dyn_loss": dyn_val, "encoder_kl": kl_val, "enc_grad_norm": grad_norm}
 
     def pretrain_encoder(self, envs, seg_steps: int = 512, n_iters: int = 50,
-                         mini_epochs: int = 10, mb_size: int = 64) -> Dict[str, np.ndarray]:
+                         enc_steps: int = 32, mb_segments: int = 4) -> Dict[str, np.ndarray]:
         """
         Train encoder and decoder on uniform-random rollouts, with no COIN and no PPO.
 
@@ -2765,7 +2871,8 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         while the RL model trains online (``train_step(..., update_encoder=False)``). Random
         actions are the standard choice for dynamics pretraining -- they excite the
         transition model broadly, and the contingency signature is in the transitions, not
-        in the returns. Pass one FRESH env per segment, as for :meth:`train_step`.
+        in the returns. Pass one FRESH env per segment, as for :meth:`train_step`. Segments
+        go into the same :attr:`replay` pool, so later iterations still see earlier ones.
 
         Returns:
             Dict[str, np.ndarray]: Per-iteration ``dyn_loss``, ``encoder_kl`` and
@@ -2775,7 +2882,6 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         history: Dict[str, List[float]] = defaultdict(list)
 
         for _ in range(n_iters):
-            seg_feats = []
             for env in envs:
                 obs_t = self._flatten_obs(env.reset()[0])
                 obs, act, rew, nxt = [], [], [], []
@@ -2789,10 +2895,9 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                     if done or trunc:
                         next_obs, _ = env.reset()
                     obs_t = self._flatten_obs(next_obs)
-                seg_feats.append(self._segment_features(obs, act, rew, nxt))
+                self.replay.push(self._segment_features(obs, act, rew, nxt))
 
-            for key, val in self._update_encoder(
-                    torch.cat(seg_feats), L, mini_epochs, mb_size).items():
+            for key, val in self._update_encoder(L, enc_steps, mb_segments).items():
                 history[key].append(val)
 
         return {k: np.asarray(v, dtype=float) for k, v in history.items()}
@@ -2801,7 +2906,8 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
     # Training step
     # ------------------------------------------------------------------
     def train_step(self, envs, coin, seg_steps: int = 512, mini_epochs: int = 10,
-                   mb_size: int = 64, cues=None, update_encoder: bool = True):
+                   mb_size: int = 64, cues=None, update_encoder: bool = True,
+                   enc_steps: int = 32, mb_segments: int = 4, carry_state: bool = True):
         """
         Collect one segment-interleaved rollout and update on it.
 
@@ -2812,21 +2918,40 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         ``CustomCartPoleEnv.__init__`` computes its derived constants once, so mutating a
         live env leaves them stale -- and optionally one ``cues`` entry per segment.
 
+        The episode is carried across boundaries (:meth:`_start_segment`), including the
+        boundary between two calls, so a rollout edge is not a special event for the task
+        sequence. COIN's sensory noise for each trial is set to the encoder's own posterior
+        sd; the noise FLOOR belongs on the model (``sigma_motor_noise``), which the pipeline
+        adds in quadrature.
+
+        Acting weights are updated WITHIN the segment: step 0 acts on COIN's predicted pi,
+        and every transition thereafter folds its encoder factor into an online prefix
+        posterior whose current ``(z, sd)`` reweights the prediction via
+        :meth:`_step_context_weights`. COIN's own trial-end update is untouched -- it still
+        observes only the segment-final posterior mean.
+
         Args:
             update_encoder (bool): False freezes encoder and decoder and reports their
                 losses under ``no_grad`` only. With a pretrained encoder that reduces this
                 to the plain COIN-PPO routine with COIN stepped inside.
+            enc_steps (int): Encoder gradient steps per call, each on ``mb_segments``
+                segments drawn from :attr:`replay`. PPO still trains on the fresh rollout
+                alone.
+            carry_state (bool): False resets every segment to a fresh episode.
 
         Returns:
             dict: Per-segment arrays ``z``, ``z_sd``, ``K`` (pre-observation), ``pi``
-            ``[S, W]``, ``rho`` ``[S, W]`` (post-observation diagnostics),
-            ``mean_episode_return``, plus scalar ``mean_reward_per_step``, ``value_loss``,
-            ``policy_loss``, ``dyn_loss``, ``encoder_kl``, ``enc_grad_norm``.
+            ``[S, W]``, ``rho`` ``[S, W]`` (post-observation diagnostics), ``w_mean``
+            ``[S, W]`` (step-averaged acting weights), ``sharpen_step`` (first step whose
+            max acting weight exceeds 0.9; ``nan`` if never),
+            ``mean_episode_return`` (``nan`` where no episode ENDED in that segment), plus
+            scalar ``mean_reward_per_step``, ``value_loss``, ``policy_loss``, ``dyn_loss``,
+            ``encoder_kl``, ``enc_grad_norm``.
         """
         S, L = len(envs), int(seg_steps)
         enc, W = self.encoder, self.num_contexts
         store: Dict[str, List[Any]] = defaultdict(list)
-        seg_feats, seg_w, seg_last_obs, seg_returns = [], [], [], []
+        seg_feats, seg_w, seg_w_final, seg_last_obs, seg_returns = [], [], [], [], []
         seg_z, seg_z_sd, seg_K, seg_pi, seg_rho = [], [], [], [], []
 
         # ---------- 1. interleaved rollout ----------
@@ -2840,19 +2965,28 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             # min(K, W - 1) keeps coin_context_vector in range; renormalise_novel folds any
             # overflow mass (more COIN contexts than heads) into the novel column.
             pi_agent = coin_context_vector(pi_vec, min(K, W - 1), width=W)
-            w_s = self._policy_weights(pi_agent)      # CONSTANT for the whole segment
+            w_s = self._policy_weights(pi_agent)      # w_0: the predicted pi, pre-evidence
             seg_K.append(K)
             seg_pi.append(pi_agent)
             seg_w.append(w_s)
 
-            obs_t = self._flatten_obs(env.reset()[0])
+            # Solution 2 machinery: per-context Gaussians queried once, then an online
+            # prefix posterior (running natural parameters, the streaming twin of
+            # :meth:`ContingencyEncoder.prefix_posterior`) reweights pi every step.
+            ctx_mu, ctx_var = self._segment_context_gaussians(coin, min(K, W - 1))
+            floor2 = float(getattr(coin, "sigma_motor_noise", 0.0)) ** 2
+            prior_prec = 1.0 / (self.prior_sd ** 2)
+            eta1 = eta2 = 0.0
+            w_t = w_s
+
+            obs_t, ep_ret = self._start_segment(env, carry_state)
             obs, act, rew, nxt = [], [], [], []
-            ep_returns, ep_ret = [], 0.0
+            ep_returns, done, trunc = [], False, False
 
             for _ in range(L):
                 with torch.no_grad():
-                    value = self._mixed_value(obs_t.unsqueeze(0), w_s)[0].item()
-                    action_np, logp, _, _ = self.act(obs_t, w_s)
+                    value = self._mixed_value(obs_t.unsqueeze(0), w_t)[0].item()
+                    action_np, logp, _, _ = self.act(obs_t, w_t)
                 next_obs, reward, done, trunc, _ = env.step(action_np)
 
                 # next_obs is stored BEFORE any reset: letting the reset overwrite it
@@ -2864,6 +2998,19 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                 store["logp"].append(logp.cpu())
                 store["val"].append(value)
                 store["done"].append(bool(done or trunc))
+                store["w"].append(w_t.cpu())
+
+                # Fold this transition's factor into the online posterior and update the
+                # acting weights for the NEXT step. COIN itself is not consulted.
+                with torch.no_grad():
+                    mu_f, sig_f = enc.factors(
+                        self._segment_features(obs[-1:], act[-1:], rew[-1:], nxt[-1:]))
+                iv = float(1.0 / (sig_f * sig_f))
+                eta2 += iv
+                eta1 += float(mu_f) * iv
+                var_t = 1.0 / (eta2 + prior_prec)
+                w_t = self._policy_weights(self._step_context_weights(
+                    pi_agent, eta1 * var_t, float(np.sqrt(var_t)), ctx_mu, ctx_var, floor2))
 
                 ep_ret += reward
                 if done or trunc:
@@ -2872,18 +3019,33 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                     ep_ret = 0.0
                 obs_t = self._flatten_obs(next_obs)
 
+            seg_w_final.append(w_t)
+
+            # An episode that outlives the segment is handed to the next one; only a
+            # terminal ending forces the next segment to reset.
+            if carry_state:
+                self._carry = None if (done or trunc) else {
+                    "state": np.array(env.state), "elapsed": int(env._elapsed_steps),
+                    "ep_ret": ep_ret}
+
             store["obs"] += obs
             store["act"] += act
             store["rew"] += rew
             feats_s = self._segment_features(obs, act, rew, nxt)
             seg_feats.append(feats_s)
+            self.replay.push(feats_s)
             seg_last_obs.append(obs_t)
-            seg_returns.append(float(np.mean(ep_returns)) if ep_returns else 0.0)
+            # A return belongs to the segment the episode ENDED in; nan, not zero, where no
+            # episode ended, so the diagnostic is not diluted by the carried ones.
+            seg_returns.append(float(np.mean(ep_returns)) if ep_returns else np.nan)
 
             with torch.no_grad():
                 mean_s, sd_s = enc.prefix_posterior(feats_s, L)
             seg_z.append(float(mean_s[0, -1]))
             seg_z_sd.append(float(sd_s[0, -1]))
+            # COIN's sensory noise for this trial IS the encoder's uncertainty; the pipeline
+            # reads it fresh at every use and adds sigma_motor_noise (the floor) in quadrature.
+            coin.sigma_sensory_noise = float(sd_s[0, -1])
             coin.observe_y(float(mean_s[0, -1]))       # plain float: COIN works in float64
 
             # Post-observation diagnostics; K may have grown, so re-query the alignment.
@@ -2898,14 +3060,18 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         act_tensor = act_tensor.float() if self.action_continuous else act_tensor.long()
         old_logp = torch.stack(store["logp"]).to(self.device).float()
         feats = torch.cat(seg_feats)
-        w_all = torch.stack(seg_w).repeat_interleave(L, dim=0)          # [S * L, W]
+        w_all = torch.stack(store["w"]).to(self.device)                 # [S * L, W]
 
         adv_parts, ret_parts = [], []
         with torch.no_grad():
             for s in range(S):
                 sl = slice(s * L, (s + 1) * L)
-                last_val = self._mixed_value(seg_last_obs[s].unsqueeze(0), seg_w[s])[0].item()
-                # GAE never crosses a task boundary: each segment bootstraps on its own.
+                # GAE never crosses a boundary, but the episode does: bootstrap under the
+                # weights the episode will actually continue under -- the next segment's
+                # w_0. The last segment has no successor yet, so it uses its own final
+                # (sharpest) within-segment weights.
+                w_next = seg_w[s + 1] if s + 1 < S else seg_w_final[s]
+                last_val = self._mixed_value(seg_last_obs[s].unsqueeze(0), w_next)[0].item()
                 a, r = self._compute_advantages(
                     store["rew"][sl], store["val"][sl], store["done"][sl], last_val)
                 adv_parts.append(a)
@@ -2944,7 +3110,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
 
         # ---------- 4. encoder + decoder update ----------
         if update_encoder:
-            enc_stats = self._update_encoder(feats, L, mini_epochs, mb_size)
+            enc_stats = self._update_encoder(L, enc_steps, mb_segments)
         else:
             with torch.no_grad():
                 mean, sd = enc.prefix_posterior(feats, L)
@@ -2956,10 +3122,14 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
 
         # ---------- 5. diagnostics ----------
         self._weights_version += 1
+        w_steps = w_all.detach().cpu().numpy().reshape(S, L, W)
+        sharp = np.argmax(w_steps.max(axis=2) > 0.9, axis=1).astype(float)
+        sharp[~(w_steps.max(axis=2) > 0.9).any(axis=1)] = np.nan
         return {
             "z": np.asarray(seg_z, dtype=float), "z_sd": np.asarray(seg_z_sd, dtype=float),
             "K": np.asarray(seg_K, dtype=int),
             "pi": np.asarray(seg_pi, dtype=float), "rho": np.asarray(seg_rho, dtype=float),
+            "w_mean": w_steps.mean(axis=1), "sharpen_step": sharp,
             "mean_episode_return": np.asarray(seg_returns, dtype=float),
             "mean_reward_per_step": float(np.mean(store["rew"])),
             "value_loss": float(critic_loss.item()), "policy_loss": float(actor_loss.item()),
