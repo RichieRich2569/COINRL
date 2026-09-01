@@ -83,6 +83,11 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--tasks", type=int, nargs=2, default=[0, 2])
     ap.add_argument("--rollouts", type=int, default=50)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="stream seed: seed_everything, COIN rng, rollout env seeds"
+                         " (experts and probe/eval seeds stay fixed across arms)")
+    ap.add_argument("--value-pi-source", default="stationary",
+                    choices=["stationary", "predicted"])
     args = ap.parse_args()
 
     import torch
@@ -98,12 +103,13 @@ def main():
     MC, FLAT = A, B                       # probe/trace slots reuse the 10c naming
     BLOCKS = ((A, args.rollouts), (B, args.rollouts))
     print(f"pair: {f3.TASK_NAMES[A]} -> {f3.TASK_NAMES[B]}, "
-          f"{args.rollouts} rollouts each", flush=True)
+          f"{args.rollouts} rollouts each, seed {args.seed}, "
+          f"value_pi_source={args.value_pi_source}", flush=True)
 
     t0 = time.perf_counter()
     experts = {t: pretrain_expert(t) for t in (MC, FLAT)}
 
-    rl.seed_everything(0)
+    rl.seed_everything(args.seed)
     proto = f3.make_task_env(MC, None, 200)
     agent = AmortisedCOINPPOAgent(
         proto, CTX_IDS, z_scale=2.0, prior_sd=0.5, kl_coef=0.0,
@@ -112,10 +118,11 @@ def main():
         rail_coef=1.0, z_channel_noise=0.4,
         value_coef=1e-3, decoder_residual=True, encoder_reward=True,
         observe_value=True, episodic_value_steps=True,
-        value_pi_source="stationary",
+        value_pi_source=args.value_pi_source,
         same_task_rollout=True, **f3.PPO_KWARGS)
     proto.close()
-    coin = RealTimeCOIN(rng=0, sigma_motor_noise=0.05, prior_mean_retention=0.9995,
+    coin = RealTimeCOIN(rng=args.seed, sigma_motor_noise=0.05,
+                        prior_mean_retention=0.9995,
                         state_dim=2,
                         process_noise_covariance=np.diag([0.0089 ** 2, 0.01 ** 2]),
                         max_contexts=10)
@@ -140,7 +147,8 @@ def main():
     i = 0
     for task, n_roll in BLOCKS:
         for _ in range(n_roll):
-            envs = f3.make_task_envs(task, 8, seed=i * 100, max_episode_steps=200)
+            envs = f3.make_task_envs(task, 8, seed=i * 100 + args.seed,
+                                     max_episode_steps=200)
             r = agent.train_step(envs, coin, seg_steps=SEG_STEPS, mini_epochs=10,
                                  mb_size=64, enc_steps=160, mb_segments=4,
                                  carry_state=False)
