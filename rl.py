@@ -4113,9 +4113,17 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                 v_heads[j] = self.nets[cid][2](obs_t).squeeze(-1)
         v_mixed = (w.unsqueeze(1) * v_heads).sum(dim=0)
         loss = (v_mixed - rtg_t).pow(2).mean()
+        if not torch.isfinite(loss):
+            return None
 
         self.enc_optim.zero_grad()
         (self.value_coef * loss).backward()
+        # A single non-finite gradient would poison every parameter through the
+        # clip's total-norm; skip the step instead of stepping into NaN.
+        for p in self.encoder.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                self.enc_optim.zero_grad()
+                return None
         clip = (float("inf") if self.enc_grad_clip is None
                 else float(self.enc_grad_clip))
         nn.utils.clip_grad_norm_(self.encoder.parameters(), clip)
