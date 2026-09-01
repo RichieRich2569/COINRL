@@ -1,4 +1,4 @@
-"""
+﻿"""
 test_rl.py
 
 Basic pytest coverage for the dynamics-based amortised COIN-PPO block of :mod:`rl`:
@@ -20,7 +20,7 @@ import torch.nn as nn
 import curriculum
 from curriculum import MarkovTaskCurriculum
 from environments import CustomCartPoleEnv
-from rl import (AmortisedCOINPPOAgent, ContingencyEncoder, FiLMDecoder,
+from rl import (AmortisedCOINPPOAgent, ContingencyEncoder,
                 SegmentReplayBuffer, coin_predicted_pi, seed_envs, seed_everything)
 
 realtimecoin = pytest.importorskip("realtimecoin")
@@ -291,8 +291,7 @@ def test_train_step_smoke(agent):
         assert set(out) == {"z", "z_sd", "K", "pi", "rho", "w_mean", "sharpen_step",
                             "mean_episode_return", "mean_reward_per_step", "value_loss",
                             "policy_loss", "dyn_loss", "encoder_kl", "enc_grad_norm",
-                            "anchor_loss", "anchor_free", "disp_loss", "inv_loss",
-                            "enc_value_loss", "repel_flagged", "ep_value_steps"}
+                            "enc_value_loss"}
         for key in ("z", "z_sd", "K", "mean_episode_return", "sharpen_step"):
             assert out[key].shape == (S,)
         for key in ("pi", "rho", "w_mean"):
@@ -315,8 +314,7 @@ def test_pretrain_encoder_and_frozen_train_step(agent):
 
     history = agent.pretrain_encoder(envs, seg_steps=32, n_iters=2, enc_steps=2, mb_segments=2)
 
-    assert set(history) == {"dyn_loss", "encoder_kl", "enc_grad_norm",
-                            "anchor_loss", "anchor_free", "disp_loss", "inv_loss"}
+    assert set(history) == {"dyn_loss", "encoder_kl", "enc_grad_norm"}
     for values in history.values():
         assert values.shape == (2,) and np.isfinite(values).all()
     assert any(not torch.equal(b, p)
@@ -337,39 +335,25 @@ def test_pretrain_encoder_and_frozen_train_step(agent):
 #----- Segment replay -----
 
 def test_segment_replay_buffer():
-    """A reservoir in segments: fills in order, then samples uniformly, detached.
-
-    Every slot carries its code anchor and its arrival index alongside the features, and
-    ``sample`` hands the two back aligned.
-    """
+    """A reservoir in segments: fills in order, then samples uniformly, detached."""
     np.random.seed(0)
     buf = SegmentReplayBuffer(capacity=3)
     for i in range(3):
-        buf.push(torch.full((4, 2), float(i)), anchor=-float(i))
+        buf.push(torch.full((4, 2), float(i)))
 
     # Below capacity the reservoir is just the stream, in order.
     assert len(buf) == 3 and buf.n_seen == 3
     assert [float(f[0, 0]) for f in buf.buffer] == [0.0, 1.0, 2.0]
-    assert buf.anchors == [0.0, -1.0, -2.0] and buf.push_ids == [0, 1, 2]
 
     for i in range(3, 20):
-        buf.push(torch.full((4, 2), float(i)), anchor=-float(i))
+        buf.push(torch.full((4, 2), float(i)))
     assert len(buf) == 3 and buf.n_seen == 20        # capacity never exceeded
-    # The three parallel lists never come apart: anchor == -tag, push_id == tag.
-    for feats, a, p in zip(buf.buffer, buf.anchors, buf.push_ids):
-        assert a == -float(feats[0, 0]) and p == int(feats[0, 0])
 
-    feats, anchors = buf.sample(2)
-    assert feats.shape == (2 * 4, 2) and anchors.shape == (2,)
-    assert buf.sample(10)[0].shape == (3 * 4, 2)                     # capped at the pool
-    feats, anchors = buf.sample(3)
+    feats = buf.sample(2)
+    assert feats.shape == (2 * 4, 2)
+    assert buf.sample(10).shape == (3 * 4, 2)                        # capped at the pool
+    feats = buf.sample(3)
     assert len({float(v) for v in feats[:, 0]}) == 3                 # no duplicates
-    assert torch.allclose(anchors, -feats[::4, 0])                   # still aligned
-
-    # An anchor is optional; absent means "not pinned", which the encoder reads as nan.
-    unpinned = SegmentReplayBuffer(capacity=2)
-    unpinned.push(torch.zeros(4, 2))
-    assert np.isnan(unpinned.anchors[0]) and np.isnan(float(unpinned.sample(1)[1][0]))
 
     with pytest.raises(RuntimeError):
         SegmentReplayBuffer().sample(1)
@@ -406,22 +390,20 @@ def test_segment_replay_buffer_clears_on_length_change():
     np.random.seed(0)
     buf = SegmentReplayBuffer(capacity=3)
     for i in range(9):
-        buf.push(torch.full((4, 2), float(i)), anchor=float(i))
+        buf.push(torch.full((4, 2), float(i)))
     assert len(buf) == 3 and buf.n_seen == 9
 
     live = torch.zeros(6, 2, requires_grad=True)
-    buf.push(live, anchor=7.0)              # a new segment length empties the pool
+    buf.push(live)                          # a new segment length empties the pool
     assert len(buf) == 1 and buf.n_seen == 1                # the reservoir count restarts
     assert not buf.buffer[-1].requires_grad                 # stored detached, on CPU
     assert buf.buffer[-1].shape == (6, 2)
-    # The anchors and arrival indices are cleared with the features, never left dangling.
-    assert buf.anchors == [7.0] and buf.push_ids == [0]
 
     # And the fresh reservoir fills from scratch under the new length.
     for i in range(4):
-        buf.push(torch.full((6, 2), float(i)), anchor=float(i))
+        buf.push(torch.full((6, 2), float(i)))
     assert len(buf) == 3 and all(f.shape == (6, 2) for f in buf.buffer)
-    assert len(buf.anchors) == 3 and len(buf.push_ids) == 3
+    assert len(buf.group_ids) == 3
 
 
 def test_train_step_fills_replay(agent):
@@ -436,162 +418,9 @@ def test_train_step_fills_replay(agent):
     assert len(agent.replay) == 2 * S
 
     assert all(f.shape == (L, agent.encoder.in_dim) for f in agent.replay.buffer)
-    feats, anchors = agent.replay.sample(2 * S)
-    assert feats.shape == (2 * S * L, agent.encoder.in_dim) and anchors.shape == (2 * S,)
-    # Every rollout segment arrives with the code the encoder gave it, and the default
-    # warm-up then frees all four again -- nothing is pinned this early.
-    assert agent.replay.push_ids == [0, 1, 2, 3] and agent.replay.n_seen == 2 * S
-    assert np.isnan(agent.replay.anchors).all()
-
-
-#----- Code-stability anchor -----
-
-def test_anchor_loss_is_zero_until_the_encoder_moves(agent):
-    """The anchor is the encoder's own past: zero at the moment of stamping, positive once
-    the map has moved -- which is the whole mechanism, stated as a test."""
-    L = 16
-    agent.anchor_coef = 1.0
-    agent.anchor_warmup = 0        # pinning from the first segment...
-    agent.anchor_window = 0        # ...and nothing exempted as "still arriving"
-
-    # Segments stamped with the CURRENT encoder's codes.
-    for feats in (torch.randn(L, agent.encoder.in_dim) for _ in range(4)):
-        with torch.no_grad():
-            mean, _ = agent.encoder.prefix_posterior(feats, L)
-        agent.replay.push(feats, float(mean[0, -1]))
-
-    # enc_steps=1 reports the loss of the forward pass that precedes the only update, so
-    # this is the anchor term under exactly the parameters that stamped the anchors.
-    stats = agent._update_encoder(L, enc_steps=1, mb_segments=4)
-    assert stats["anchor_free"] == 0.0
-    assert stats["anchor_loss"] == pytest.approx(0.0, abs=1e-12)
-
-    # Move the map deliberately: a bias shift on the encoder's mean head relabels every
-    # segment at once, exactly the rotation the anchor exists to resist.
-    with torch.no_grad():
-        agent.encoder.net.net[-1].bias[0] += 1.0
-    moved = agent._update_encoder(L, enc_steps=1, mb_segments=4)
-    assert moved["anchor_loss"] > 1e-4
-
-
-def test_settle_anchors_frees_warmup_and_recent_segments(agent):
-    """Which segments carry an anchor: none under warm-up, then everything but the last
-    ``anchor_window`` pushed -- each stamped once, with the code it had when it settled."""
-    L, n = 16, 6
-    for i in range(n):
-        agent.replay.push(torch.randn(L, agent.encoder.in_dim), anchor=float(100 + i))
-
-    agent.anchor_warmup, agent.anchor_window = 10, 2
-    assert agent._settle_anchors(L) == n                        # n_seen (6) <= warmup (10)
-    assert np.isnan(agent.replay.anchors).all()                 # warm-up pins nothing
-
-    agent.anchor_warmup = 0                                     # warm-up over
-    assert agent._settle_anchors(L) == 2                        # push_ids 4 and 5 stay free
-    stamped = list(agent.replay.anchors)
-    assert np.isfinite(stamped[:4]).all() and np.isnan(stamped[4:]).all()
-    assert all(abs(a) < agent.z_scale + 1e-6 for a in stamped[:4])   # codes, not 100+
-
-    with torch.no_grad():                                       # move the map
-        agent.encoder.net.net[-1].bias[0] += 1.0
-    assert agent._settle_anchors(L) == 2
-    assert agent.replay.anchors[:4] == stamped[:4]        # a settled code is stamped ONCE
-
-    agent.anchor_window = 0
-    assert agent._settle_anchors(L) == 0                        # nothing free: all pinned
-    assert np.isfinite(agent.replay.anchors).all()
-
-
-#----- Code dispersion -----
-
-def test_dispersion_hinge(agent):
-    """Positive while the group codes are clustered, exactly zero once they are spread."""
-    agent.disp_target_sd = 1.0
-    solo = torch.arange(5)                       # every code its own group -> plain hinge
-
-    # All codes equal: no variance at all, so the hinge is the full target, squared.
-    assert float(agent._dispersion_loss(torch.zeros(5), solo)[0]) == pytest.approx(1.0)
-    assert float(agent._dispersion_loss(torch.full((4,), 0.7),
-                                        torch.arange(4))[0]) == pytest.approx(1.0)
-
-    # Spread beyond the target: a HINGE, so the gradient is off, not merely small.
-    spread = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0])          # sd = 1.58 > 1.0
-    assert float(agent._dispersion_loss(spread, solo)[0]) == 0.0
-    spread = spread.clone().requires_grad_(True)
-    agent._dispersion_loss(spread, solo)[0].backward()
-    assert torch.count_nonzero(spread.grad) == 0
-
-    # Partly spread: (target - sd)^2, and it pulls the codes apart.
-    half = torch.tensor([-0.5, 0.0, 0.5])                        # sd = 0.5
-    assert float(agent._dispersion_loss(half, torch.arange(3))[0]) == pytest.approx(0.25)
-    half = half.clone().requires_grad_(True)
-    agent._dispersion_loss(half, torch.arange(3))[0].backward()
-    # Gradient DESCENT moves against the gradient, so the outermost codes travel outward.
-    assert -half.grad[0] < 0 and -half.grad[-1] > 0
-    assert half.grad[1] == pytest.approx(0.0, abs=1e-7)          # the centre code stays
-
-    # Fewer than two groups carries no variance information.
-    assert float(agent._dispersion_loss(torch.zeros(1), torch.zeros(1, dtype=torch.long))[0]) == 0.0
-
-
-def test_dispersion_uses_group_means_and_penalises_within_group_spread(agent):
-    """The exploit the plain hinge allowed -- buying variance with within-task noise --
-    scores badly under the grouped form, and the invariance term prices it."""
-    agent.disp_target_sd = 1.0
-    gidx = torch.tensor([0, 0, 1, 1])
-
-    # Two tight, well-separated tasks: hinge satisfied, nothing to pay for consistency.
-    good = torch.tensor([-1.0, -1.0, 1.0, 1.0])
-    disp, inv = agent._dispersion_loss(good, gidx)
-    assert float(disp) == 0.0 and float(inv) == pytest.approx(0.0)
-
-    # The exploit: the SAME total spread, but bought inside the groups instead of between
-    # them. The group means coincide, so the hinge is maximal AND invariance is charged.
-    exploit = torch.tensor([-1.0, 1.0, -1.0, 1.0])
-    disp, inv = agent._dispersion_loss(exploit, gidx)
-    assert float(disp) == pytest.approx(1.0)
-    assert float(inv) == pytest.approx(1.0)
-    # The two are permutations of each other, so a plain batch hinge scores them
-    # IDENTICALLY -- it is blind to the difference between separating the tasks and
-    # randomising the code within them. That blindness is the whole bug.
-    assert float(exploit.std()) == pytest.approx(float(good.std()))
-    assert float(agent._dispersion_loss(exploit, torch.arange(4))[0]) == \
-        float(agent._dispersion_loss(good, torch.arange(4))[0]) == 0.0
-
-
-def test_dispersion_reaches_the_encoder_objective(agent):
-    """``disp_coef``/``inv_coef`` are off by default, gated by warm-up, and reported."""
-    L = 16
-    assert agent.disp_coef == 0.0 and agent.inv_coef == 0.0   # opt-in: old runs unchanged
-
-    feats = torch.randn(L, agent.encoder.in_dim)
-    for _ in range(4):
-        agent.replay.push(feats.clone(), group=0)   # identical inputs, one task
-
-    agent.disp_coef, agent.inv_coef, agent.disp_target_sd = 1.0, 1.0, 1.0
-    agent.anchor_warmup = 0                          # warm-up over: dispersion is live
-    stats = agent._update_encoder(L, enc_steps=1, mb_segments=4)
-    # One group only -> no between-group variance to report, and identical inputs give it
-    # no within-group variance either.
-    assert stats["disp_loss"] == 0.0 and stats["inv_loss"] == pytest.approx(0.0)
-
-    # Two groups whose codes coincide: the hinge is maximal.
-    agent.replay.clear()
-    for g in (0, 1):
-        for _ in range(2):
-            agent.replay.push(feats.clone(), group=g)
-    stats = agent._update_encoder(L, enc_steps=1, mb_segments=4)
-    assert stats["disp_loss"] == pytest.approx(1.0, abs=1e-6)
-
-
-def test_dispersion_is_gated_by_the_anchor_warmup(agent):
-    """A one-task pool must never be asked to spread: that IS within-task spread."""
-    L = 16
-    for _ in range(4):
-        agent.replay.push(torch.randn(L, agent.encoder.in_dim), group=0)
-    agent.disp_coef, agent.disp_target_sd = 1.0, 1.0
-
-    agent.anchor_warmup = 10_000                     # still warming up
-    assert agent._update_encoder(L, enc_steps=1, mb_segments=4)["disp_loss"] == 0.0
+    feats = agent.replay.sample(2 * S)
+    assert feats.shape == (2 * S * L, agent.encoder.in_dim)
+    assert agent.replay.n_seen == 2 * S
 
 
 #----- Decoder-side gauge control -----
@@ -600,8 +429,7 @@ def make_dec_agent(**kw):
     env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
     torch.manual_seed(0)
     return AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
-                                 prior_sd=0.3, kl_coef=0.0, anchor_coef=0.0,
-                                 encoder_lr=3e-4, **kw)
+                                 prior_sd=0.3, kl_coef=0.0, encoder_lr=3e-4, **kw)
 
 
 def test_slow_decoder_lr_group():
@@ -629,336 +457,6 @@ def test_slow_decoder_lr_group():
         moved[ratio] = sum(float((p - b).abs().sum())
                            for p, b in zip(a.decoder.parameters(), before))
     assert moved[100.0] < moved[1.0] / 10.0
-
-
-def test_film_decoder_shape_and_gauge():
-    """C4: the linear-modulation decoder, and the gauge that ``normalise`` closes."""
-    torch.manual_seed(0)
-    sa = torch.randn(7, 6)
-    z = torch.randn(7)
-
-    plain = FiLMDecoder(6, 4, hidden=8, normalise=False)
-    out = plain(sa, z)
-    assert out.shape == (7, 4)
-    # z enters LINEARLY: doubling z doubles the deviation from f(s, a).
-    f_only = plain(sa, torch.zeros(7))
-    assert torch.allclose(plain(sa, 2 * z) - f_only, 2 * (out - f_only), atol=1e-5)
-
-    # THE GAUGE: z -> a*z with g -> g/a is the same function. This is the freedom that
-    # lets the encoder rescale its whole code map for free.
-    scale = 3.0
-    with torch.no_grad():
-        for prm in plain.g.net[-1].parameters():
-            prm.div_(scale)
-    assert torch.allclose(plain(sa, scale * z), out, atol=1e-5)
-
-    # Normalising g's output layer closes it: g's scale is no longer free, so rescaling z
-    # is now observable in the output.
-    torch.manual_seed(0)
-    normed = FiLMDecoder(6, 4, hidden=8, normalise=True)
-    out_n = normed(sa, z)
-    with torch.no_grad():
-        for prm in normed.g.net[-1].parameters():
-            prm.div_(scale)
-    assert torch.allclose(normed(sa, z), out_n, atol=1e-5)      # g's scale is inert...
-    assert not torch.allclose(normed(sa, scale * z), out_n, atol=1e-3)   # ...so z's is not
-
-
-def test_decoder_arch_wiring_and_validation():
-    """The agent builds, decodes and trains through either decoder; default is unchanged."""
-    L = 16
-    assert isinstance(make_dec_agent().decoder, nn.Module)
-    assert make_dec_agent().decoder_arch == "concat"
-
-    for norm in (False, True):
-        a = make_dec_agent(decoder_arch="film", film_normalise=norm)
-        assert isinstance(a.decoder, FiLMDecoder)
-        feats = torch.randn(L, a.encoder.in_dim)
-        assert a._decode_next_obs(feats, torch.randn(L)).shape == (L, a.obs_dim)
-        for _ in range(4):
-            a.replay.push(feats.clone())
-        before = [p.detach().clone() for p in a.decoder.parameters()]
-        out = a._update_encoder(L, enc_steps=2, mb_segments=4)
-        assert np.isfinite(out["dyn_loss"])
-        assert any(not torch.equal(b, p)
-                   for b, p in zip(before, a.decoder.parameters()))
-
-    with pytest.raises(ValueError):
-        make_dec_agent(decoder_arch="flim")
-
-
-#----- Structure-not-values anchors -----
-
-def test_centroid_anchor_frees_a_symmetric_split_but_charges_a_sweep(agent):
-    """Variant A, stated as a test: splitting a cluster is free, moving it is not."""
-    agent.anchor_mode, agent.anchor_group_gap = "centroid", 0.05
-    stamped = torch.tensor([-1.0, -1.0, 1.0, 1.0])       # two clusters, far apart
-
-    # A symmetric split of BOTH clusters: members move +-0.09, every centroid stays.
-    split = torch.tensor([-1.09, -0.91, 0.91, 1.09])
-    assert float(agent._anchor_penalty(split, stamped)) == pytest.approx(0.0, abs=1e-12)
-    # The plain value anchor charges the very same move.
-    agent.anchor_mode = "value"
-    assert float(agent._anchor_penalty(split, stamped)) == pytest.approx(0.09 ** 2)
-
-    # A uniform translation moves every centroid, so it is charged in full either way.
-    agent.anchor_mode = "centroid"
-    shifted = stamped + 0.2
-    assert float(agent._anchor_penalty(shifted, stamped)) == pytest.approx(0.04)
-
-    # An ASYMMETRIC split still moves the centroid and is charged accordingly.
-    lopsided = torch.tensor([-1.0, -0.8, 1.0, 1.0])      # cluster 0 centroid moves +0.1
-    assert float(agent._anchor_penalty(lopsided, stamped)) == pytest.approx(0.01 / 2)
-
-    # With the gap below a cluster's own width every code becomes its own cluster and the
-    # centroid form degenerates to the value form -- the knob does what it says. (Stamps
-    # must be DISTINCT for this: no positive gap can ever split identical values.)
-    spread_stamps = torch.tensor([-1.02, -0.98, 0.98, 1.02])
-    agent.anchor_group_gap = 1e-9
-    assert float(agent._anchor_penalty(spread_stamps + 0.09,
-                                       spread_stamps)) == pytest.approx(0.09 ** 2)
-
-
-def test_distance_anchor_frees_expansion_and_charges_contraction(agent):
-    """Variant B: a split is an expansion, so it must cost nothing."""
-    agent.anchor_mode = "distance"
-    stamped = torch.tensor([-1.0, 1.0])
-
-    assert float(agent._anchor_penalty(stamped.clone(), stamped)) == pytest.approx(0.0)
-    # Expansion: free, and with no gradient at all.
-    grown = torch.tensor([-1.5, 1.5], requires_grad=True)
-    pen = agent._anchor_penalty(grown, stamped)
-    assert float(pen) == pytest.approx(0.0)
-    pen.backward()
-    assert torch.count_nonzero(grown.grad) == 0
-    # Contraction: charged (distance 2.0 -> 1.0).
-    assert float(agent._anchor_penalty(torch.tensor([-0.5, 0.5]),
-                                       stamped)) == pytest.approx(1.0)
-    # Translation is charged even though every pairwise distance is preserved -- this is
-    # the term that stops the map escaping the hinge as a rigid body.
-    assert float(agent._anchor_penalty(stamped + 0.3, stamped)) == pytest.approx(0.09)
-
-    # LIMITATION, asserted so it cannot be forgotten: inside a wider set a symmetric split
-    # is NOT free. Splitting [-1,-1] apart moves its inner member toward the far cluster,
-    # so the cross-pair (1,2) contracts 2.00 -> 1.82 and is charged, even though the split
-    # itself is an expansion. Variant B is therefore stricter than the centroid form on
-    # exactly the move we want to permit -- one charged pair out of six.
-    st = torch.tensor([-1.0, -1.0, 1.0, 1.0])
-    pen = float(agent._anchor_penalty(torch.tensor([-1.09, -0.91, 0.91, 1.09]), st))
-    assert pen == pytest.approx(0.18 ** 2 / 6)
-    agent.anchor_mode = "centroid"
-    agent.anchor_group_gap = 0.05
-    assert float(agent._anchor_penalty(torch.tensor([-1.09, -0.91, 0.91, 1.09]),
-                                       st)) == pytest.approx(0.0, abs=1e-12)
-
-
-def test_code_clusters_and_stratified_sampling():
-    """Clustering reads stamps only, and the draw supplies cluster-mates."""
-    np.random.seed(0)
-    torch.manual_seed(0)
-    buf = SegmentReplayBuffer(capacity=40)
-    codes = ([-1.0] * 10 + [-0.98] * 10 + [1.0] * 10)     # two clusters at gap 0.05
-    for i, c in enumerate(codes):
-        buf.push(torch.full((2, 3), float(i)), anchor=c)
-    buf.push(torch.full((2, 3), 99.0))                    # unsettled: must be ignored
-
-    clusters = buf.code_clusters(gap=0.05)
-    assert len(clusters) == 2 and sorted(len(c) for c in clusters) == [10, 20]
-    assert all(np.isfinite(buf.anchors[i]) for c in clusters for i in c)
-    # A tighter gap splits the near-coincident pair apart.
-    assert len(buf.code_clusters(gap=0.01)) == 3
-
-    feats, anchors = buf.sample_code_groups(4, gap=0.05, per_group=2)
-    assert feats.shape == (4 * 2, 3) and anchors.shape == (4,)
-    # Two clusters x two members each: some pair must share a cluster.
-    rounded = np.round(anchors.numpy(), 2)
-    assert len(rounded) - len(set(rounded)) >= 1
-
-
-def test_anchor_mode_defaults_and_validation(agent):
-    """Default behaviour is untouched, and a typo fails loudly."""
-    assert agent.anchor_mode == "value"
-    with pytest.raises(ValueError):
-        AmortisedCOINPPOAgent(CustomCartPoleEnv(max_episode_steps=50), CTX_IDS,
-                              encoder_hidden=8, anchor_mode="centoid")
-
-
-def test_structure_anchors_reach_the_encoder_objective():
-    """Both variants run end to end through ``_update_encoder`` and report a loss."""
-    L = 16
-    for mode in ("centroid", "distance"):
-        env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
-        torch.manual_seed(0)
-        a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
-                                  prior_sd=0.3, kl_coef=0.0, anchor_coef=1.0,
-                                  anchor_window=0, anchor_warmup=0, anchor_mode=mode)
-        for _ in range(6):
-            a.replay.push(torch.randn(L, a.encoder.in_dim))
-        a._settle_anchors(L)                       # stamp them all
-        assert np.isfinite(a.replay.anchors).all()
-        stats = a._update_encoder(L, enc_steps=1, mb_segments=4)
-        # Freshly stamped: the codes have not moved yet, so every form reads ~0.
-        assert stats["anchor_loss"] == pytest.approx(0.0, abs=1e-9)
-
-        with torch.no_grad():                      # a bodily sweep: all forms charge it
-            a.encoder.net.net[-1].bias[0] += 1.0
-        assert a._update_encoder(L, enc_steps=1, mb_segments=4)["anchor_loss"] > 1e-4
-
-
-#----- Recency-balanced replay -----
-
-def test_sample_balanced_reserves_half_the_batch_for_the_newest_segments():
-    """Half the draw comes from the newest window however the pool is composed -- the
-    point being a late task's gradient share stops depending on its share of the stream."""
-    np.random.seed(0)
-    torch.manual_seed(0)
-    buf = SegmentReplayBuffer(capacity=100)
-    for i in range(100):                     # tag each segment with its arrival index
-        buf.push(torch.full((2, 3), float(i)))
-
-    window = 10                              # newest 10 => tags 90..99
-    counts = np.zeros(100)
-    for _ in range(400):
-        feats, anchors = buf.sample_balanced(8, window)
-        assert feats.shape == (8 * 2, 3) and anchors.shape == (8,)
-        tags = feats[::2, 0].numpy().astype(int)
-        assert len(set(tags)) == 8           # still without replacement
-        counts[tags] += 1
-        assert (tags >= 90).sum() >= 4       # at least half from the recent window
-
-    recent_share = counts[90:].sum() / counts.sum()
-    # 4 of 8 guaranteed recent, plus the uniform half occasionally landing there.
-    assert 0.5 <= recent_share <= 0.62
-    assert counts[:90].min() > 0             # the old 90% are still all reachable
-
-
-def test_sample_balanced_falls_back_when_there_is_nothing_recent():
-    """A pool with fewer recent segments than half the batch still returns a full batch."""
-    np.random.seed(0)
-    buf = SegmentReplayBuffer(capacity=10)
-    for i in range(10):
-        buf.push(torch.full((2, 3), float(i)))
-
-    feats, _ = buf.sample_balanced(6, recent_window=1)     # only one segment is "recent"
-    assert feats.shape == (6 * 2, 3)
-    assert len({float(v) for v in feats[::2, 0]}) == 6
-    # And a batch larger than the pool is capped, not padded.
-    assert buf.sample_balanced(50, recent_window=4)[0].shape == (10 * 2, 3)
-
-
-def test_balanced_replay_is_off_by_default_and_reaches_the_encoder(agent):
-    """Opt-in, and when on it is the sampler ``_update_encoder`` actually calls."""
-    L = 16
-    assert agent.balanced_replay is False
-    for _ in range(6):
-        agent.replay.push(torch.randn(L, agent.encoder.in_dim))
-
-    seen = []
-    inner = agent.replay.sample_balanced
-    agent.replay.sample_balanced = lambda n, w: (seen.append((n, w)) or inner(n, w))
-
-    agent._update_encoder(L, enc_steps=1, mb_segments=4)
-    assert seen == []                                   # default path untouched
-
-    agent.balanced_replay = True
-    agent._update_encoder(L, enc_steps=1, mb_segments=4)
-    assert seen == [(4, agent.anchor_window)]
-
-
-def test_z_channel_noise_is_off_by_default_and_changes_only_the_sampled_z(agent):
-    """Zero keeps the plain objective bit-for-bit; a positive floor perturbs the draw."""
-    L = 16
-    assert agent.z_channel_noise == 0.0
-    for _ in range(6):
-        agent.replay.push(torch.randn(L, agent.encoder.in_dim))
-
-    def one_step(noise):
-        states = {m: {k: v.detach().clone() for k, v in m.state_dict().items()}
-                  for m in (agent.encoder, agent.decoder)}
-        opt_state = agent.enc_optim.state_dict()
-        agent.z_channel_noise = noise
-        torch.manual_seed(7)
-        np.random.seed(7)
-        stats = agent._update_encoder(L, enc_steps=1, mb_segments=4)
-        agent.z_channel_noise = 0.0
-        for m, s in states.items():
-            m.load_state_dict(s)
-        agent.enc_optim.load_state_dict(opt_state)
-        return stats["dyn_loss"]
-
-    base, again, noisy = one_step(0.0), one_step(0.0), one_step(0.5)
-    assert base == again                        # zero is exactly the old path
-    assert np.isfinite(noisy) and noisy != base  # the channel actually perturbs z
-
-
-def test_quantile_readout_off_by_default_is_identity(agent):
-    """Without the flag every observation passes through untouched."""
-    assert agent.quantile_readout is False
-    agent._refresh_code_population(16)
-    assert agent._code_pop is None
-    assert agent._obs_transform(0.37, 0.05) == (0.37, 0.05)
-
-
-def test_quantile_transform_is_invariant_to_monotone_warps():
-    """The whole point: probit(rank) is unchanged by any monotone relabelling."""
-    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
-    torch.manual_seed(0)
-    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
-                              prior_sd=0.3, kl_coef=0.0, quantile_readout=True)
-    rng = np.random.default_rng(3)
-    pop = np.sort(rng.normal(size=64))
-    z, sd = float(pop[40]) + 1e-6, 0.2
-
-    a._code_pop = pop
-    z1, s1 = a._obs_transform(z, sd)
-
-    warp = lambda x: np.tanh(1.7 * x) + 0.03 * x ** 3   # strictly monotone
-    a._code_pop = np.sort(warp(pop))
-    z2, s2 = a._obs_transform(float(warp(z)), np.nan)   # sd needs its own interval
-    assert z1 == pytest.approx(z2, abs=1e-9)            # rank -> same probit
-
-    # sd maps through the same interval rule and is floored away from zero
-    a._code_pop = pop
-    _, s_edge = a._obs_transform(float(pop[-1]) + 5.0, 0.01)
-    assert s_edge >= 1e-3
-    assert s1 > 0.0
-
-
-def test_quantile_population_comes_from_the_current_encoder():
-    """Refresh re-encodes stored segments; a changed encoder changes the population."""
-    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
-    torch.manual_seed(0)
-    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
-                              prior_sd=0.3, kl_coef=0.0, quantile_readout=True)
-    L = 16
-    for _ in range(10):
-        a.replay.push(torch.randn(L, a.encoder.in_dim))
-    a._refresh_code_population(L)
-    pop1 = a._code_pop.copy()
-    assert pop1.shape[0] == 10 and np.all(np.diff(pop1) >= 0)
-
-    with torch.no_grad():
-        for p in a.encoder.parameters():
-            p.add_(torch.randn_like(p) * 0.5)
-    a._refresh_code_population(L)
-    assert not np.allclose(a._code_pop, pop1)
-
-    # seg_len inferred from the buffer when omitted (the evaluate_identifying path)
-    a._refresh_code_population()
-    assert a._code_pop.shape[0] == 10
-
-
-def test_residual_decoder_predicts_state_plus_delta(agent):
-    """decoder_residual adds s back: prediction = s + f(s, a, z), same f either way."""
-    L = 8
-    feats = torch.randn(L, agent.encoder.in_dim)
-    z = torch.zeros(L)
-    assert agent.decoder_residual is False
-    plain = agent._decode_next_obs(feats, z)
-    agent.decoder_residual = True
-    residual = agent._decode_next_obs(feats, z)
-    agent.decoder_residual = False
-    assert torch.allclose(residual, feats[:, :agent.obs_dim] + plain)
 
 
 def _value_loss_setup(agent, perturb_head=False):
@@ -1005,17 +503,6 @@ def test_value_coef_is_off_by_default(agent):
     assert agent.value_coef == 0.0
 
 
-def test_rail_hinge_charges_saturated_codes_only(agent):
-    """rail_coef penalises |mean|/z_scale beyond 0.8 and is inert inside it."""
-    assert agent.rail_coef == 0.0
-    zs = agent.z_scale
-    inner = torch.tensor([0.0, 0.5 * zs, -0.79 * zs])
-    outer = torch.tensor([0.95 * zs, -zs])
-    hinge = lambda v: torch.relu(v.abs() / zs - 0.8).pow(2).mean()
-    assert float(hinge(inner)) == 0.0
-    assert float(hinge(outer)) > 0.0
-
-
 def test_encoder_reward_layout_and_prediction():
     """(s, a, r, s') layout: s' stays the last obs_dim columns, the decoder grows a
     reward head trained by _dyn_loss, and the reward never reaches the decoder input."""
@@ -1055,86 +542,6 @@ def test_encoder_reward_off_keeps_the_old_interface(agent):
     f1 = agent._segment_features(obs, [0] * L, nxt)
     f2 = agent._segment_features(obs, [0] * L, nxt, rew=[9.9] * L)
     assert torch.equal(f1, f2)
-
-
-def make_repel_agent():
-    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
-    torch.manual_seed(0)
-    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
-                              prior_sd=0.3, kl_coef=0.0, repel_coef=1.0)
-    a.ensure_contexts(1)
-    return a
-
-
-def _repel_inputs(a, ret_scale):
-    L = 8
-    feats = a._segment_features([torch.randn(a.obs_dim) for _ in range(L)], [0] * L,
-                                [torch.randn(a.obs_dim) for _ in range(L)])
-    rho = np.zeros(a.num_contexts)
-    rho[0] = 1.0
-    ctx = (np.array([0.1, 0.0]), np.array([0.05, 0.25]), 1e-4)
-    obs = torch.randn(L, a.obs_dim)
-    ret = torch.full((L,), float(ret_scale))
-    return [feats], [rho], [ctx], obs, ret, L
-
-
-def test_value_surprise_gate_needs_a_baseline_and_a_blowup():
-    """First sight sets the baseline (no flag); a same-scale repeat updates it; a
-    blow-up flags the segment; and the blow-up does NOT poison the baseline."""
-    a = make_repel_agent()
-    cid = a.context_keys[0]
-    assert a._flag_value_surprise(*_repel_inputs(a, 1.0)) == 0     # baseline set
-    base = a._vloss_ema[cid]
-    assert a._flag_value_surprise(*_repel_inputs(a, 1.0)) == 0     # ordinary: EMA
-    assert a._flag_value_surprise(*_repel_inputs(a, 500.0)) == 1   # massive: flag
-    assert len(a._repel_batch) == 1
-    assert a._vloss_ema[cid] == pytest.approx(base, rel=0.5)       # not poisoned
-    # repel_coef == 0 disables everything
-    a.repel_coef = 0.0
-    assert a._flag_value_surprise(*_repel_inputs(a, 500.0)) == 0
-    assert a._repel_batch == []
-
-
-def test_value_surprise_never_fires_on_the_novel_column():
-    """A rollout routed to novel has no established head to be surprised by."""
-    a = make_repel_agent()
-    seg_feats, _, ctx, obs, ret, L = _repel_inputs(a, 500.0)
-    rho = np.zeros(a.num_contexts)
-    rho[-1] = 1.0                                  # dominant = novel
-    assert a._flag_value_surprise(seg_feats, [rho], ctx, obs, ret, L) == 0
-
-
-def test_repel_hinge_pushes_the_code_away_from_the_parked_centre():
-    """Gradient steps on the hinge alone move the segment's code away from mu_c,
-    and the hinge dies once the margin is cleared."""
-    a = make_repel_agent()
-    L = 8
-    # Break the zero-init symmetry (fresh encoders emit exactly 0 for everything, and
-    # |z - mu| has no gradient at exactly 0 -- unreachable in real use, where the
-    # gate only fires on established, trained contexts).
-    with torch.no_grad():
-        for p in a.encoder.parameters():
-            p.add_(torch.randn_like(p) * 0.05)
-    feats = a._segment_features([torch.randn(a.obs_dim) for _ in range(L)], [0] * L,
-                                [torch.randn(a.obs_dim) for _ in range(L)])
-    with torch.no_grad():
-        mean, _ = a.encoder.prefix_posterior(feats, L)
-    mu_c = float(mean[0, -1]) + 0.005              # park the centre next to the code
-    a._repel_batch = [(feats, mu_c)]
-    a.repel_margin = 0.1
-
-    def dist():
-        with torch.no_grad():
-            m, _ = a.encoder.prefix_posterior(feats, L)
-        return abs(float(m[0, -1]) - mu_c)
-
-    d0 = dist()
-    opt = torch.optim.Adam(a.encoder.parameters(), lr=1e-2)
-    for _ in range(50):
-        loss = a._repel_hinge(L)
-        opt.zero_grad(); loss.backward(); opt.step()
-    assert dist() > d0 + 0.02                      # actually moved away
-    assert float(a._repel_hinge(L)) < 1e-4 or dist() >= 0.1  # hinge released
 
 
 #----- 2-D COIN value observation -----
@@ -1236,70 +643,6 @@ def test_observe_value_feeds_coin_2d_vectors():
     env.close()
 
 
-def test_episodic_value_step_moves_the_encoder_and_handles_md_contexts():
-    """One completed episode's worth of evidence takes a real encoder step, for both
-    scalar and MD-shaped context arrays; default stays off; bad pi_source raises."""
-    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
-    torch.manual_seed(0)
-    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
-                              prior_sd=0.3, kl_coef=0.0, value_coef=1e-3,
-                              episodic_value_steps=True)
-    assert AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8,
-                                 ).episodic_value_steps is False
-    with pytest.raises(ValueError):
-        AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8,
-                              value_pi_source="bogus")
-    a.ensure_contexts(2)
-    with torch.no_grad():
-        for p in a.nets[a.context_keys[1]][2].parameters():
-            p.add_(torch.randn_like(p))
-        for p in a.encoder.parameters():
-            p.add_(torch.randn_like(p) * 0.05)
-
-    L = 12
-    obs = [torch.randn(a.obs_dim) for _ in range(L)]
-    nxt = [torch.randn(a.obs_dim) for _ in range(L)]
-    frew = [1.0] * L
-    feats = a._segment_features(obs, [0] * L, nxt, rew=frew)
-    rtg = np.cumsum(frew[::-1])[::-1].copy()
-    pi = np.full(a.num_contexts, np.nan)
-    pi[:2] = 0.5
-    pi[-1] = 0.0
-
-    before = [p.detach().clone() for p in a.encoder.parameters()]
-    v = a._episodic_value_step(obs, rtg, feats, pi,
-                               np.array([-0.1, 0.1, 0.0]),
-                               np.array([0.05, 0.05, 0.25]), 1e-4)
-    assert v is not None and np.isfinite(v)
-    assert any(not torch.equal(b, p.detach())
-               for b, p in zip(before, a.encoder.parameters()))
-
-    # MD-shaped centres/vars (k+1, 2): the helper slices the z-dim.
-    v2 = a._episodic_value_step(obs, rtg, feats, pi,
-                                np.array([[-0.1, 0.5], [0.1, -0.5], [0.0, 0.0]]),
-                                np.array([[0.05, 1.0], [0.05, 1.0], [0.25, 1.0]]),
-                                1e-4)
-    assert v2 is not None and np.isfinite(v2)
-
-
-def test_protect_heads_flags_without_repulsion(agent):
-    """The value-surprise gate serves protect_heads even at repel_coef == 0: flagged
-    segment indices are recorded (for the PPO mask) while the repel batch stays
-    empty; both stay empty when neither consumer is on."""
-    assert agent.protect_heads is False
-    agent.ensure_contexts(1)
-    args = _repel_inputs(agent, 1.0)
-    agent.protect_heads = True
-    assert agent._flag_value_surprise(*args) == 0          # baseline set
-    n = agent._flag_value_surprise(*_repel_inputs(agent, 500.0))
-    assert n == 1 and agent._flagged_segments == [0]
-    assert agent._repel_batch == []                        # repulsion stays off
-
-    agent.protect_heads = False
-    assert agent._flag_value_surprise(*_repel_inputs(agent, 500.0)) == 0
-    assert agent._flagged_segments == []
-
-
 def test_observe_value_uses_raw_returns_on_shaped_envs():
     """The value observation must ride the RAW reward channel: on a shaped
     MountainCar the observed r_bar equals the raw episodic mean, not the shaped one."""
@@ -1349,119 +692,6 @@ def test_observe_value_uses_raw_returns_on_shaped_envs():
         # is displaced by the potential difference. The observation must be raw.
         assert -0.5 <= r_obs <= 0.0
         assert abs(r_obs - (-40.0 / 200.0)) < 0.1
-
-
-#----- EMA-teacher anchor -----
-
-def make_ema_agent(tau=0.9, anchor_coef=1.0):
-    """An agent in EMA-teacher mode, on the same tiny CartPole interface as ``agent``."""
-    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
-    torch.manual_seed(0)
-    return AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3, prior_sd=0.3,
-                                 kl_coef=0.0, anchor_coef=anchor_coef, anchor_ema_tau=tau)
-
-
-def test_ema_teacher_starts_as_a_copy_and_takes_no_gradient():
-    """Built from the student, detached from it, and never optimised."""
-    a = make_ema_agent()
-    assert a.encoder_ema is not None and a.encoder_ema is not a.encoder
-    for t, s in zip(a.encoder_ema.parameters(), a.encoder.parameters()):
-        assert torch.equal(t, s)                       # an exact copy at construction
-        assert not t.requires_grad                     # ...that can never take a gradient
-    assert not a.encoder_ema.training                  # eval mode
-
-    # The teacher is not in any optimiser, so no step can reach it.
-    owned = {id(p) for opt in a._all_optimizers() for g in opt.param_groups
-             for p in g["params"]}
-    owned |= {id(p) for g in a.enc_optim.param_groups for p in g["params"]}
-    assert not any(id(p) in owned for p in a.encoder_ema.parameters())
-
-    # And it does not inflate the reported trainable parameter count.
-    from baselines import fig3_common as f3
-    plain = AmortisedCOINPPOAgent(CustomCartPoleEnv(max_episode_steps=50), CTX_IDS,
-                                  encoder_hidden=8, z_scale=0.3, prior_sd=0.3)
-    assert f3.count_parameters(a) == f3.count_parameters(plain)
-
-
-def test_ema_teacher_trails_the_student():
-    """One EMA step moves the teacher exactly ``(1 - tau)`` of the way to the student."""
-    a = make_ema_agent(tau=0.9)
-    before = [t.detach().clone() for t in a.encoder_ema.parameters()]
-    with torch.no_grad():                              # move the student by a known amount
-        for s in a.encoder.parameters():
-            s.add_(1.0)
-    a._update_ema_teacher()
-
-    for t, b0, s in zip(a.encoder_ema.parameters(), before, a.encoder.parameters()):
-        assert torch.allclose(t, 0.9 * b0 + 0.1 * s, atol=1e-6)
-        assert not torch.allclose(t, s)                # trailing, not tracking exactly
-
-    # Repeated steps with a still student converge the teacher onto it.
-    for _ in range(200):
-        a._update_ema_teacher()
-    for t, s in zip(a.encoder_ema.parameters(), a.encoder.parameters()):
-        assert torch.allclose(t, s, atol=1e-6)
-
-
-def test_ema_anchor_is_zero_at_init_and_positive_once_the_student_moves():
-    """The whole mechanism, as a test: no penalty while student and teacher agree, a real
-    one as soon as the student relabels the map."""
-    L = 16
-    a = make_ema_agent(tau=0.999)
-    for _ in range(4):
-        a.replay.push(torch.randn(L, a.encoder.in_dim))
-
-    # Teacher == student at construction, so the anchor is identically zero.
-    stats = a._update_encoder(L, enc_steps=1, mb_segments=4)
-    assert stats["anchor_loss"] == pytest.approx(0.0, abs=1e-12)
-    assert stats["anchor_free"] == 0.0                 # stamping is inert in EMA mode
-
-    # Relabel the map: a bias shift on the encoder's mean head moves every code at once.
-    with torch.no_grad():
-        a.encoder.net.net[-1].bias[0] += 1.0
-    assert a._update_encoder(L, enc_steps=1, mb_segments=4)["anchor_loss"] > 1e-4
-
-
-def test_ema_mode_stamps_nothing():
-    """No stored code, no window, no warm-up -- so no task-boundary information is used."""
-    L = 16
-    a = make_ema_agent()
-    a.anchor_window, a.anchor_warmup = 0, 0            # settings that WOULD stamp
-    for _ in range(4):
-        a.replay.push(torch.randn(L, a.encoder.in_dim))
-
-    assert a._settle_anchors(L) == 0
-    assert np.isnan(a.replay.anchors).all()            # nothing was ever stamped
-    a._update_encoder(L, enc_steps=2, mb_segments=4)
-    assert np.isnan(a.replay.anchors).all()
-
-
-def test_ema_teacher_bounds_code_velocity():
-    """The point of the mode: the map may move, but only as fast as the teacher follows.
-
-    Same student, same data, same number of steps -- a tighter ``tau`` must not move the
-    code further than a looser one.
-    """
-    L, feats = 16, torch.randn(16, 15)
-
-    def travel(tau):
-        a = make_ema_agent(tau=tau, anchor_coef=50.0)
-        a.encoder.load_state_dict(make_ema_agent(tau=tau).encoder.state_dict())
-        f = feats[:, :a.encoder.in_dim].clone()
-        for _ in range(6):
-            a.replay.push(f.clone())
-        with torch.no_grad():
-            z0 = float(a.encoder.prefix_posterior(f, L)[0][0, -1])
-        # A strong, consistent pull on the map: shift the mean head every step.
-        for _ in range(15):
-            with torch.no_grad():
-                a.encoder.net.net[-1].bias[0] += 0.05
-            a._update_encoder(L, enc_steps=2, mb_segments=4)
-        with torch.no_grad():
-            z1 = float(a.encoder.prefix_posterior(f, L)[0][0, -1])
-        return abs(z1 - z0)
-
-    assert travel(0.999) <= travel(0.9) + 1e-6
 
 
 #----- Episode carry-over -----
