@@ -83,6 +83,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--tasks", type=int, nargs=2, default=[0, 2])
     ap.add_argument("--rollouts", type=int, default=50)
+    ap.add_argument("--anchor", type=float, default=0.0,
+                    help="stamped-anchor coef (w64/wu0); pins settled codes against "
+                         "the absent-context map slide E1/E2 exposed")
     args = ap.parse_args()
 
     import torch
@@ -108,7 +111,7 @@ def main():
     agent = AmortisedCOINPPOAgent(
         proto, CTX_IDS, z_scale=2.0, prior_sd=0.5, kl_coef=0.0,
         encoder_lr=1.5e-4, replay_capacity=512,
-        anchor_coef=0.0, anchor_window=64, anchor_warmup=0,
+        anchor_coef=float(args.anchor), anchor_window=64, anchor_warmup=0,
         rail_coef=1.0, z_channel_noise=0.4,
         value_coef=1e-3, decoder_residual=True, encoder_reward=True,
         observe_value=True, episodic_value_steps=True,
