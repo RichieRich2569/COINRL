@@ -3095,6 +3095,27 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         value_process_noise (float): Documented per-trial drift budget for the value
             dimension; read by the notebook when building the 2-D COIN (the agent
             itself never constructs COIN models).
+        episodic_value_steps (bool): Take one value-gradient encoder step at EVERY
+            completed episode inside the rollout, instead of the single per-rollout
+            step. Each finished episode supplies realized raw return-to-go targets
+            for its own states; the routing posterior is the segment's prefix
+            posterior UP TO that step -- exactly the evidence an eval episode would
+            hold at the same point, so every call rehearses the evaluation
+            condition. The budget scales with the value evidence that actually
+            arrived, and lands inside the arrival window where the crash errors
+            live -- the measured ~0.005/step force gets tens of steps per rollout
+            instead of one. Capped at ``value_step_cap`` per segment (early
+            CartPole finishes ~25 episodes per segment). Requires
+            ``value_coef > 0``. Default off.
+        value_step_cap (int): Episode-triggered value steps allowed per segment.
+        value_pi_source (str): Prior for the episodic value steps' responsibilities:
+            ``"predicted"`` uses COIN's current predicted pi (matches training
+            routing); ``"stationary"`` uses the stationary prior evaluation starts
+            from -- the eval-faithful variant, which keeps an established rival
+            context competing at a shared code all block long, so the value error
+            (and hence the z-separating gradient) persists until the z-marginal
+            alone routes correctly instead of dying once COIN's richer prior fixes
+            routing.
         repel_coef (float): Weight of the **value-surprise repulsion** -- the objective
             fix for head-level parking. The mixture-form value term
             (``value_coef``) is a boundary refiner: its gradient carries a
@@ -3226,6 +3247,8 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                  observe_value: bool = False, value_obs_scale: float = 200.0,
                  value_obs_noise_floor: float = 0.05,
                  value_process_noise: float = 0.01,
+                 episodic_value_steps: bool = False, value_step_cap: int = 4,
+                 value_pi_source: str = "predicted",
                  **kwargs):
         super().__init__(env, ctx_ids, **kwargs)
         self.z_scale, self.prior_sd = float(z_scale), float(prior_sd)
@@ -3254,6 +3277,12 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         self.decoder_residual = bool(decoder_residual)
         self.encoder_reward = bool(encoder_reward)
         self.rail_coef = float(rail_coef)
+        self.episodic_value_steps = bool(episodic_value_steps)
+        self.value_step_cap = int(value_step_cap)
+        if value_pi_source not in ("predicted", "stationary"):
+            raise ValueError(f"value_pi_source must be predicted/stationary, "
+                             f"got {value_pi_source!r}")
+        self.value_pi_source = str(value_pi_source)
         self.repel_coef = float(repel_coef)
         self.repel_margin = None if repel_margin is None else float(repel_margin)
         self.repel_gate_ratio = float(repel_gate_ratio)
@@ -4035,6 +4064,64 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             total = total + torch.relu(margin - d).pow(2)
         return total
 
+    def _episodic_value_step(self, obs_ep, rtg_ep, feats_so_far, pi_agent,
+                             ctx_mu, ctx_var, floor2) -> Optional[float]:
+        """One encoder value-gradient step from a single completed episode.
+
+        ``feats_so_far`` is the current segment's transitions up to the episode's
+        final step; its full-prefix posterior is the routing evidence available at
+        that moment. Responsibilities are rebuilt differentiably (torch twin of
+        :meth:`_step_context_weights`, z-dim centres), the heads' DETACHED values on
+        the episode's states are mixed under them and scored against the realized
+        raw return-to-go. Returns the loss value, or None when no usable weights.
+        """
+        L = int(feats_so_far.shape[0])
+        mean, sd = self.encoder.prefix_posterior(feats_so_far.to(self.device), L)
+        z_t, sd_t = self._soft_obs_transform(mean[0, -1], sd[0, -1])
+
+        k = len(ctx_mu) - 1
+        mu = np.asarray(ctx_mu, dtype=float)
+        if mu.ndim > 1:
+            mu = mu[:, 0]                       # MD contexts: z-dim centres
+        var = np.asarray(ctx_var, dtype=float)
+        if var.ndim > 1:
+            var = var[:, 0]
+        mu_t = torch.as_tensor(mu, dtype=z_t.dtype, device=z_t.device)
+        var_t = (torch.as_tensor(var, dtype=z_t.dtype, device=z_t.device)
+                 + sd_t * sd_t + floor2)
+        ll = -0.5 * ((z_t - mu_t) ** 2 / var_t + torch.log(var_t))
+        like = torch.exp(ll - ll.max().detach())
+        pi_t = torch.as_tensor(np.nan_to_num(np.asarray(pi_agent, dtype=float),
+                                             nan=0.0),
+                               dtype=z_t.dtype, device=z_t.device)
+        w = torch.zeros(self.num_contexts, dtype=z_t.dtype, device=z_t.device)
+        w[:k] = pi_t[:k] * like[:k]
+        w[-1] = pi_t[-1] * like[-1]
+        total = w.sum()
+        if not torch.isfinite(total) or float(total) <= 0.0:
+            return None
+        w = w / total
+
+        obs_t = torch.stack(obs_ep).to(self.device)
+        rtg_t = torch.as_tensor(rtg_ep, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            v_heads = torch.zeros(self.num_contexts, obs_t.shape[0],
+                                  device=self.device)
+            for j, cid in enumerate(self.context_keys):
+                if self.context_init.get(cid, 0) == 0:
+                    continue
+                v_heads[j] = self.nets[cid][2](obs_t).squeeze(-1)
+        v_mixed = (w.unsqueeze(1) * v_heads).sum(dim=0)
+        loss = (v_mixed - rtg_t).pow(2).mean()
+
+        self.enc_optim.zero_grad()
+        (self.value_coef * loss).backward()
+        clip = (float("inf") if self.enc_grad_clip is None
+                else float(self.enc_grad_clip))
+        nn.utils.clip_grad_norm_(self.encoder.parameters(), clip)
+        self.enc_optim.step()
+        return float(loss.item())
+
     def _encoder_value_loss(self, seg_feats, seg_pi, seg_ctx, obs_tensor,
                             ret_tensor, seg_len: int):
         """The value-gradient encoder term (see ``value_coef`` in the class docstring).
@@ -4159,6 +4246,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         store: Dict[str, List[Any]] = defaultdict(list)
         seg_feats, seg_w, seg_w_final, seg_last_obs, seg_returns = [], [], [], [], []
         seg_z, seg_z_sd, seg_K, seg_pi, seg_rho, seg_ctx = [], [], [], [], [], []
+        n_ep_vsteps = 0     # episode-triggered value-gradient steps this rollout
 
         # ---------- 1. interleaved rollout ----------
         for s, env in enumerate(envs):
@@ -4195,6 +4283,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             # episode's pre-boundary raw sum is unknown; carry_state is False in the
             # Figure-3 protocol, where this is exact.)
             ep_ret_raw, ep_raw_returns = 0.0, []
+            ep_start, seg_vsteps, pi_val = 0, 0, None
 
             for _ in range(L):
                 with torch.no_grad():
@@ -4239,8 +4328,27 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                     next_obs, _ = env.reset()
                     ep_returns.append(ep_ret)
                     ep_raw_returns.append(ep_ret_raw)
+                    if (self.episodic_value_steps and self.value_coef > 0.0
+                            and update_encoder and seg_vsteps < self.value_step_cap):
+                        # One value step per completed episode: realized raw
+                        # return-to-go targets, routing from the segment's prefix
+                        # so far -- the evidence an eval episode would hold here.
+                        rtg = np.cumsum(frew[ep_start:][::-1])[::-1].copy()
+                        if self.value_pi_source == "stationary":
+                            if pi_val is None:
+                                pi_val = self._eval_prior_pi(coin, min(K, W - 1))
+                        else:
+                            pi_val = pi_agent
+                        v = self._episodic_value_step(
+                            obs[ep_start:], rtg,
+                            self._segment_features(obs, act, nxt, rew=frew),
+                            pi_val, ctx_mu, ctx_var, floor2)
+                        if v is not None:
+                            seg_vsteps += 1
+                            n_ep_vsteps += 1
                     ep_ret = 0.0
                     ep_ret_raw = 0.0
+                    ep_start = len(obs)
                 obs_t = self._flatten_obs(next_obs)
 
             seg_w_final.append(w_t)
@@ -4407,6 +4515,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             "mean_reward_per_step": float(np.mean(store["rew"])),
             "value_loss": float(critic_loss.item()), "policy_loss": float(actor_loss.item()),
             "repel_flagged": float(n_repel),
+            "ep_value_steps": float(n_ep_vsteps),
             **enc_stats,
         }
 

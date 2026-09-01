@@ -292,7 +292,7 @@ def test_train_step_smoke(agent):
                             "mean_episode_return", "mean_reward_per_step", "value_loss",
                             "policy_loss", "dyn_loss", "encoder_kl", "enc_grad_norm",
                             "anchor_loss", "anchor_free", "disp_loss", "inv_loss",
-                            "enc_value_loss", "repel_flagged"}
+                            "enc_value_loss", "repel_flagged", "ep_value_steps"}
         for key in ("z", "z_sd", "K", "mean_episode_return", "sharpen_step"):
             assert out[key].shape == (S,)
         for key in ("pi", "rho", "w_mean"):
@@ -1234,6 +1234,52 @@ def test_observe_value_feeds_coin_2d_vectors():
     res = agent.evaluate_identifying(env, coin, n_episodes=2, max_steps=8)
     assert res["returns"].shape == (2,) and np.isfinite(res["returns"]).all()
     env.close()
+
+
+def test_episodic_value_step_moves_the_encoder_and_handles_md_contexts():
+    """One completed episode's worth of evidence takes a real encoder step, for both
+    scalar and MD-shaped context arrays; default stays off; bad pi_source raises."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    torch.manual_seed(0)
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
+                              prior_sd=0.3, kl_coef=0.0, value_coef=1e-3,
+                              episodic_value_steps=True)
+    assert AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8,
+                                 ).episodic_value_steps is False
+    with pytest.raises(ValueError):
+        AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8,
+                              value_pi_source="bogus")
+    a.ensure_contexts(2)
+    with torch.no_grad():
+        for p in a.nets[a.context_keys[1]][2].parameters():
+            p.add_(torch.randn_like(p))
+        for p in a.encoder.parameters():
+            p.add_(torch.randn_like(p) * 0.05)
+
+    L = 12
+    obs = [torch.randn(a.obs_dim) for _ in range(L)]
+    nxt = [torch.randn(a.obs_dim) for _ in range(L)]
+    frew = [1.0] * L
+    feats = a._segment_features(obs, [0] * L, nxt, rew=frew)
+    rtg = np.cumsum(frew[::-1])[::-1].copy()
+    pi = np.full(a.num_contexts, np.nan)
+    pi[:2] = 0.5
+    pi[-1] = 0.0
+
+    before = [p.detach().clone() for p in a.encoder.parameters()]
+    v = a._episodic_value_step(obs, rtg, feats, pi,
+                               np.array([-0.1, 0.1, 0.0]),
+                               np.array([0.05, 0.05, 0.25]), 1e-4)
+    assert v is not None and np.isfinite(v)
+    assert any(not torch.equal(b, p.detach())
+               for b, p in zip(before, a.encoder.parameters()))
+
+    # MD-shaped centres/vars (k+1, 2): the helper slices the z-dim.
+    v2 = a._episodic_value_step(obs, rtg, feats, pi,
+                                np.array([[-0.1, 0.5], [0.1, -0.5], [0.0, 0.0]]),
+                                np.array([[0.05, 1.0], [0.05, 1.0], [0.25, 1.0]]),
+                                1e-4)
+    assert v2 is not None and np.isfinite(v2)
 
 
 def test_observe_value_uses_raw_returns_on_shaped_envs():
