@@ -1,0 +1,32 @@
+pair: CartPole -> InvertedCartPole, 50 rollouts each, seed 1, value_pi_source=stationary
+[expert CartPole] final train return 200.0
+[expert InvertedCartPole] final train return 200.0
+F:\Projects\COINRL\rl.py:4101: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:837.)
+  if not torch.isfinite(total) or float(total) <= 0.0:
+[inject] rollout 0: head 0 <- CartPole expert
+[  0] task=CartPole        z_mc=-0.031 z_flat=-0.031 gap=0.000 K=1 vsteps=32 ret=16.3
+[inject] rollout 1: head 1 <- CartPole expert
+[inject] rollout 1: head 2 <- CartPole expert
+[ 10] task=CartPole        z_mc=+0.007 z_flat=+0.007 gap=0.000 K=3 vsteps=8 ret=200.0
+[ 20] task=CartPole        z_mc=+0.509 z_flat=+0.507 gap=0.002 K=3 vsteps=8 ret=200.0
+[ 30] task=CartPole        z_mc=+0.725 z_flat=+0.723 gap=0.002 K=3 vsteps=8 ret=200.0
+[ 40] task=CartPole        z_mc=+0.954 z_flat=+0.951 gap=0.003 K=3 vsteps=8 ret=200.0
+[inject] rollout 50: head 3 <- InvertedCartPole expert
+[inject] rollout 50: head 4 <- InvertedCartPole expert
+[ 50] task=InvertedCartPole z_mc=+1.469 z_flat=+1.465 gap=0.004 K=5 vsteps=29 ret=42.4
+[inject] rollout 51: head 5 <- InvertedCartPole expert
+[inject] rollout 54: head 6 <- InvertedCartPole expert
+[inject] rollout 56: head 7 <- InvertedCartPole expert
+[inject] rollout 57: head 8 <- InvertedCartPole expert
+[ 60] task=InvertedCartPole z_mc=+0.266 z_flat=+0.263 gap=0.002 K=9 vsteps=8 ret=200.0
+[ 70] task=InvertedCartPole z_mc=-0.085 z_flat=-0.085 gap=0.000 K=9 vsteps=8 ret=200.0
+[ 80] task=InvertedCartPole z_mc=-0.284 z_flat=-0.282 gap=0.001 K=9 vsteps=8 ret=200.0
+[ 90] task=InvertedCartPole z_mc=+0.007 z_flat=+0.008 gap=0.000 K=9 vsteps=8 ret=200.0
+[eval] CartPole        : return    66.2  head 6 (w=0.85)
+[eval] InvertedCartPole: return   200.0  head 6 (w=0.94)
+
+gap at FlatMC arrival: 0.003   gap at end: 0.000   pooled probe sd: 0.000   d-prime end: 1.3
+K final: 9   value steps/rollout (FlatMC block): 9.7
+FAIL - divergence gate: gap_end > max(3*pooled_sd, gap_start+0.2)
+FAIL - eval-separation gate: distinct dominant heads under z-marginal eval
