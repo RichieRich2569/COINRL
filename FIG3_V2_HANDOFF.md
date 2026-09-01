@@ -48,10 +48,15 @@ The runner is `scripts/run_phase.py` (executes a temp copy of figures.ipynb cell
 `scripts/eval_pilot.py [path-to-npz]`. Each seed writes
 `models/fig3_amortised_s{seed}.npz`, so parallel seeds do not collide.
 
-The **synthesis stack** constructor substitution used below:
+The **synthesis stack** constructor substitution used below (NOTE 2026-09-01: 
+`repel_coef` REMOVED from the default stack — machine-1 pilot 9 showed the undirected
+repulsion pushes codes into the tanh rail and pins them there (margin 0.8 > distance
+to the rail keeps the hinge active on a saturated, unmovable code). Machine-1 pilot
+10 showed the 2-D observation alone achieves 5 distinct train-time contexts. Keep
+repulsion OFF until it is made direction-aware):
 
 ```
---sub "same_task_rollout=True, **f3.PPO_KWARGS)::same_task_rollout=True, value_coef=1e-3, decoder_residual=True, encoder_reward=True, rail_coef=1.0, z_channel_noise=0.4, observe_value=True, repel_coef=1.0, **f3.PPO_KWARGS)"
+--sub "same_task_rollout=True, **f3.PPO_KWARGS)::same_task_rollout=True, value_coef=1e-3, decoder_residual=True, encoder_reward=True, rail_coef=1.0, z_channel_noise=0.4, observe_value=True, **f3.PPO_KWARGS)"
 ```
 
 and the shared substitutions for every run:
