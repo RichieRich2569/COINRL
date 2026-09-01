@@ -275,11 +275,18 @@ class CustomAcrobotEnv(TimeLimitMixin, AcrobotEnv):
 class CustomMountainCarEnv(TimeLimitMixin, MountainCarEnv):
     """A MountainCar environment that allows customizing the amplitude of the slope."""
     
-    def __init__(self, amplitude=1, gravity_sf=1, max_speed_sf=1, force_sf=1, goal_position=0.5, max_episode_steps=None, **kwargs):
+    def __init__(self, amplitude=1, gravity_sf=1, max_speed_sf=1, force_sf=1, goal_position=0.5, max_episode_steps=None, shaping_coef=0.0, shaping_gamma=0.995, **kwargs):
         """
         amplitude: The 'A' in y = A sin(3x) + offset
         goal_position: The x-position at which the episode terminates successfully.
         goal_velocity: Required velocity upon reaching the goal (default 0).
+        shaping_coef: If nonzero, adds potential-based reward shaping
+            F = shaping_gamma * Phi(s') - Phi(s) with Phi = shaping_coef * mechanical
+            energy (0.5 v^2 + U(x)), the classic aligned dense signal that makes
+            MountainCar's sparse reward learnable for policy-gradient methods at short
+            episode caps. Potential-based shaping preserves the optimal policy
+            (Ng et al., 1999). The unshaped reward is exposed as info["raw_reward"].
+        shaping_gamma: Discount used inside the shaping term (match the agent's gamma).
         """
         TimeLimitMixin.__init__(self, max_episode_steps=max_episode_steps)
         MountainCarEnv.__init__(self, render_mode=kwargs.pop("render_mode", None),
@@ -288,12 +295,32 @@ class CustomMountainCarEnv(TimeLimitMixin, MountainCarEnv):
         self.gravity_sf = gravity_sf
         self.max_speed_sf = max_speed_sf
         self.force_sf = force_sf
+        self.shaping_coef = float(shaping_coef)
+        self.shaping_gamma = float(shaping_gamma)
 
 
         self.gravity = amplitude*self.gravity*gravity_sf # Effect of changing slope equivalent to changing gravity
         self.max_speed = self.max_speed*max_speed_sf
         self.force = self.force*force_sf
         self.goal_position = goal_position
+
+    def _potential(self, x, v):
+        """Mechanical-energy shaping potential. U(x) = gravity * sin(3x) / 3 is the
+        antiderivative of the slope's gravity acceleration term, so Phi tracks the true
+        energy the optimal pump strategy accumulates; amplitude 0 leaves only the
+        kinetic term."""
+        return self.shaping_coef * (0.5 * v * v + self.gravity * np.sin(3.0 * x) / 3.0)
+
+    def step(self, action):
+        if self.shaping_coef:
+            x0, v0 = float(self.state[0]), float(self.state[1])
+            obs, reward, terminated, truncated, info = super().step(action)
+            x1, v1 = float(self.state[0]), float(self.state[1])
+            info["raw_reward"] = float(reward)
+            reward = float(reward) + self.shaping_gamma * self._potential(x1, v1) \
+                - self._potential(x0, v0)
+            return obs, reward, terminated, truncated, info
+        return super().step(action)
     
     def _height(self, xs):
         A = float(self.amplitude)
