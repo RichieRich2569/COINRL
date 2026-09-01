@@ -91,6 +91,9 @@ def main():
                          " (experts and probe/eval seeds stay fixed across arms)")
     ap.add_argument("--value-pi-source", default="stationary",
                     choices=["stationary", "predicted"])
+    ap.add_argument("--protect", action="store_true",
+                    help="protect_heads: value-surprise-flagged segments sit out "
+                         "the PPO update (detect-before-adapt at the head level)")
     args = ap.parse_args()
 
     import torch
@@ -121,7 +124,7 @@ def main():
         rail_coef=1.0, z_channel_noise=0.4,
         value_coef=1e-3, decoder_residual=True, encoder_reward=True,
         observe_value=True, episodic_value_steps=True,
-        value_pi_source=args.value_pi_source,
+        value_pi_source=args.value_pi_source, protect_heads=bool(args.protect),
         same_task_rollout=True, **f3.PPO_KWARGS)
     proto.close()
     coin = RealTimeCOIN(rng=args.seed, sigma_motor_noise=0.05,

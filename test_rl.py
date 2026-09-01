@@ -1282,6 +1282,24 @@ def test_episodic_value_step_moves_the_encoder_and_handles_md_contexts():
     assert v2 is not None and np.isfinite(v2)
 
 
+def test_protect_heads_flags_without_repulsion(agent):
+    """The value-surprise gate serves protect_heads even at repel_coef == 0: flagged
+    segment indices are recorded (for the PPO mask) while the repel batch stays
+    empty; both stay empty when neither consumer is on."""
+    assert agent.protect_heads is False
+    agent.ensure_contexts(1)
+    args = _repel_inputs(agent, 1.0)
+    agent.protect_heads = True
+    assert agent._flag_value_surprise(*args) == 0          # baseline set
+    n = agent._flag_value_surprise(*_repel_inputs(agent, 500.0))
+    assert n == 1 and agent._flagged_segments == [0]
+    assert agent._repel_batch == []                        # repulsion stays off
+
+    agent.protect_heads = False
+    assert agent._flag_value_surprise(*_repel_inputs(agent, 500.0)) == 0
+    assert agent._flagged_segments == []
+
+
 def test_observe_value_uses_raw_returns_on_shaped_envs():
     """The value observation must ride the RAW reward channel: on a shaped
     MountainCar the observed r_bar equals the raw episodic mean, not the shaped one."""
