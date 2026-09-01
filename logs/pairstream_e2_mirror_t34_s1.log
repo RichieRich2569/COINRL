@@ -1,0 +1,33 @@
+pair: CartPole -> MirrorCartPole, 50 rollouts each, seed 1, value_pi_source=stationary
+[expert CartPole] final train return 200.0
+[expert MirrorCartPole] final train return 200.0
+F:\Projects\COINRL\rl.py:4118: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:837.)
+  if not torch.isfinite(total) or float(total) <= 0.0:
+[inject] rollout 0: head 0 <- CartPole expert
+[  0] task=CartPole        z_mc=-0.031 z_flat=-0.030 gap=0.000 K=1 vsteps=32 ret=16.3
+[inject] rollout 1: head 1 <- CartPole expert
+[inject] rollout 1: head 2 <- CartPole expert
+[ 10] task=CartPole        z_mc=+0.007 z_flat=+0.007 gap=0.000 K=3 vsteps=8 ret=200.0
+[ 20] task=CartPole        z_mc=+0.509 z_flat=+0.506 gap=0.003 K=3 vsteps=8 ret=200.0
+[ 30] task=CartPole        z_mc=+0.725 z_flat=+0.721 gap=0.005 K=3 vsteps=8 ret=200.0
+[ 40] task=CartPole        z_mc=+0.954 z_flat=+0.948 gap=0.006 K=3 vsteps=8 ret=200.0
+[inject] rollout 50: head 3 <- MirrorCartPole expert
+[ 50] task=MirrorCartPole  z_mc=+1.551 z_flat=+1.547 gap=0.004 K=4 vsteps=32 ret=15.0
+[inject] rollout 51: head 4 <- MirrorCartPole expert
+[inject] rollout 53: head 5 <- MirrorCartPole expert
+[inject] rollout 53: head 6 <- MirrorCartPole expert
+[inject] rollout 54: head 7 <- MirrorCartPole expert
+[inject] rollout 56: head 8 <- MirrorCartPole expert
+[ 60] task=MirrorCartPole  z_mc=+0.463 z_flat=+0.459 gap=0.004 K=9 vsteps=8 ret=200.0
+[ 70] task=MirrorCartPole  z_mc=+0.733 z_flat=+0.725 gap=0.008 K=9 vsteps=8 ret=200.0
+[ 80] task=MirrorCartPole  z_mc=+0.060 z_flat=+0.055 gap=0.005 K=9 vsteps=8 ret=200.0
+[inject] rollout 87: head 9 <- MirrorCartPole expert
+[ 90] task=MirrorCartPole  z_mc=-0.921 z_flat=-0.915 gap=0.006 K=10 vsteps=8 ret=200.0
+[eval] CartPole        : return     9.3  head 0 (w=0.69)
+[eval] MirrorCartPole  : return    81.0  head 0 (w=0.64)
+
+gap at FlatMC arrival: 0.005   gap at end: 0.001   pooled probe sd: 0.001   d-prime end: 1.3
+K final: 10   value steps/rollout (FlatMC block): 14.5
+FAIL - divergence gate: gap_end > max(3*pooled_sd, gap_start+0.2)
+FAIL - eval-separation gate: distinct dominant heads under z-marginal eval
