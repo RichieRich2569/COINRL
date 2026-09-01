@@ -1,4 +1,4 @@
-"""
+﻿"""
 rl.py
 
 This module contains various Reinforcement Learning (RL) algorithms and helper functions,
@@ -163,7 +163,7 @@ def coin_context_vector(
         width (Optional[int]): Length of the returned vector. Defaults to ``k + 1``
             (known contexts plus novel, no uninstantiated padding).
         renormalise_novel (bool): If True (default), overwrite the novel entry with
-            ``1 - sum(known)`` — the notebooks' novel-column fix, which makes each row sum
+            ``1 - sum(known)`` â€” the notebooks' novel-column fix, which makes each row sum
             to one after the padding slots are treated as zero. Pass False for raw
             responsibility traces, which are deliberately left unnormalised.
 
@@ -199,7 +199,7 @@ def coin_context_trace(
         ks (np.ndarray): Per-trial number of known contexts, i.e. ``context_alignment()["K"]``.
         width (Optional[int]): Common row length. Defaults to ``max(ks) + 1``.
         renormalise_novel (bool): If True (default), set each row's novel entry to
-            ``1 - sum(known)`` — the notebooks' novel-column fix. Pass False for raw
+            ``1 - sum(known)`` â€” the notebooks' novel-column fix. Pass False for raw
             responsibility traces, which are deliberately left unnormalised.
 
     Returns:
@@ -391,7 +391,7 @@ class QLearningAgent:
             num_velocity_bins (int, optional): Number of bins for discretizing velocity.
             alpha (float, optional): Learning rate.
             gamma (float, optional): Discount factor.
-            epsilon (float, optional): Initial epsilon for ε-greedy strategy.
+            epsilon (float, optional): Initial epsilon for Îµ-greedy strategy.
             epsilon_decay (float, optional): Epsilon decay factor after each episode.
             min_epsilon (float, optional): Minimum value of epsilon.
             init_Q_random (bool, optional): Random-initialize Q-table if True, else zeros.
@@ -644,7 +644,7 @@ class COINQLearningAgent:
             num_velocity_bins (int, optional): Number of bins for discretizing velocity.
             alpha (float, optional): Learning rate.
             gamma (float, optional): Discount factor.
-            epsilon (float, optional): Initial epsilon for all ε-greedy strategies.
+            epsilon (float, optional): Initial epsilon for all Îµ-greedy strategies.
             epsilon_decay (float, optional): Epsilon decay factor after each episode.
             min_epsilon (float, optional): Minimum value of epsilon.
             init_Q_random (bool, optional): When True, initialise Q-table randomly, otherwise to zeros.
@@ -687,7 +687,7 @@ class COINQLearningAgent:
         self.context_init = np.zeros((max_contexts + 1,))
         self.context_init[-1] = 1  # novel
 
-        # Per-context epsilon (for ε-greedy only; ignored by other strategies)
+        # Per-context epsilon (for Îµ-greedy only; ignored by other strategies)
         self.epsdat = [epsilon for _ in range(max_contexts)]  # excludes novel; novel uses max_epsilon implicitly if needed
 
         # Build exploration strategy (global)
@@ -742,7 +742,7 @@ class COINQLearningAgent:
         """
         Choose an action using the configured exploration strategy.
         'q_row' holds the averaged Q-values at the current state.
-        For ε-greedy, 'eps' overrides the strategy's epsilon to support per-context averaging.
+        For Îµ-greedy, 'eps' overrides the strategy's epsilon to support per-context averaging.
         For other strategies, 'eps' is ignored.
         """
         epsilon_override = eps if isinstance(self.strategy, EpsilonGreedy) else None
@@ -812,7 +812,7 @@ class COINQLearningAgent:
         else:
             # Copy the last Q-table (novel) to the new context
             self.Qdat[new_context] = self.Qdat[-1].copy()
-        # Reset epsilon high for the new context (ε-greedy only)
+        # Reset epsilon high for the new context (Îµ-greedy only)
         if new_context < len(self.epsdat):
             self.epsdat[new_context] = self.max_epsilon
 
@@ -860,11 +860,11 @@ class COINQLearningAgent:
         upd_idx = np.flatnonzero((self.context_init > 0) & (p_context > 0))
         Z = np.nansum(p_context ** 2)
 
-        # Compute averaged epsilon (for ε-greedy only); fixed within the episode
+        # Compute averaged epsilon (for Îµ-greedy only); fixed within the episode
         epsavg = 0.0
         for i in range(len(self.Qdat)):
             if self.context_init[i] and not np.isnan(action_probs[i]):
-                # context epsilon (ε-greedy only); for novel (index == last), use max_epsilon
+                # context epsilon (Îµ-greedy only); for novel (index == last), use max_epsilon
                 ctx_eps = self.epsdat[i] if i < len(self.epsdat) else self.max_epsilon
                 epsavg += action_probs[i] * ctx_eps
 
@@ -889,7 +889,7 @@ class COINQLearningAgent:
                 break
 
         # Decay schedules:
-        # - For ε-greedy we keep your per-context decay rule.
+        # - For Îµ-greedy we keep your per-context decay rule.
         # - For other strategies, we call their episode hook (e.g., softmax temperature decay).
         if isinstance(self.strategy, EpsilonGreedy):
             for i in range(len(self.epsdat)):
@@ -989,7 +989,7 @@ class EmbodiedCOINQLearningAgent(COINQLearningAgent):
             alpha (float, optional): Learning rate.
             alpha_body (float, optional): Body learning rate.
             gamma (float, optional): Discount factor.
-            epsilon (float, optional): Initial epsilon for all ε-greedy strategies.
+            epsilon (float, optional): Initial epsilon for all Îµ-greedy strategies.
             epsilon_decay (float, optional): Epsilon decay factor after each episode.
             min_epsilon (float, optional): Minimum value of epsilon.
             init_Q_random (bool, optional): When True, initialise Q-table randomly, otherwise to zeros.
@@ -2689,58 +2689,9 @@ class ContingencyEncoder(nn.Module):
         return sum1 * var, torch.sqrt(var)
 
 
-class FiLMDecoder(nn.Module):
-    """
-    Linearly modulated dynamics decoder, ``s' = f(s, a) + z * g(s, a)``.
-
-    The concat decoder ``h([s, a, z])`` can represent the latent's effect through any
-    smooth warping of ``z``, which is exactly the gauge freedom that lets the encoder
-    relabel its whole code map at no cost to the dynamics loss. Restricting the latent to a
-    LINEAR modulation of a state-dependent direction (FiLM; Perez et al., AAAI 2018, and
-    the same trick CoDA-style contextual dynamics models use) removes most of that freedom:
-    ``z`` can now only scale ``g``, so the map is pinned up to one affine reparameterisation
-    instead of an arbitrary one.
-
-    That residual affine gauge is real -- ``z -> a*z`` with ``g -> g/a`` is exactly
-    equivalent -- and ``normalise=True`` closes it by renormalising ``g``'s output layer to
-    a fixed norm on every forward pass, so scaling ``g`` down is no longer available and the
-    scale of ``z`` becomes observable.
-
-    Args:
-        in_dim (int): Width of the ``(s, a_repr)`` input.
-        out_dim (int): Observation dimension being predicted.
-        hidden (int): Hidden width of both branches.
-        normalise (bool): Fix the norm of ``g``'s output layer (kills the affine gauge).
-        g_norm (float): The norm to fix it to.
-    """
-
-    def __init__(self, in_dim: int, out_dim: int, hidden: int = 64,
-                 normalise: bool = False, g_norm: float = 1.0):
-        super().__init__()
-        self.f = _MLP(in_dim, out_dim, hidden)
-        self.g = _MLP(in_dim, out_dim, hidden)
-        self.normalise, self.g_norm = bool(normalise), float(g_norm)
-
-    def _g_out(self, sa: torch.Tensor) -> torch.Tensor:
-        if not self.normalise:
-            return self.g(sa)
-        # Renormalise the final layer's weight (and bias with it) to a fixed norm. Done
-        # functionally so the parameter itself stays free and the gradient still flows.
-        last = self.g.net[-1]
-        scale = self.g_norm / last.weight.detach().norm().clamp_min(1e-8)
-        body = sa
-        for layer in self.g.net[:-1]:
-            body = layer(body)
-        return torch.nn.functional.linear(body, last.weight * scale, last.bias * scale)
-
-    def forward(self, sa: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        return self.f(sa) + z.unsqueeze(-1) * self._g_out(sa)
-
-
 class SegmentReplayBuffer:
     """
-    Reservoir pool of per-segment encoder features ``[L, in_dim]``, held on CPU, each with
-    a stored **code anchor** and the reservoir counter it was pushed at.
+    Reservoir pool of per-segment encoder features ``[L, in_dim]``, held on CPU.
 
     The dynamics objective is off-policy, so old segments stay valid targets. Replaying
     them decouples the encoder's training data from whatever tasks the latest rollout
@@ -2756,22 +2707,11 @@ class SegmentReplayBuffer:
     no evidence of the earlier tasks left and its latent drifts off them; a reservoir keeps
     a thinning-but-never-vanishing trace of every block.
 
-    Replay alone keeps the DYNAMICS of old tasks predictable; it does not keep their
-    *code* -- the encoder is free to relabel every segment at once, and a rotation of the
-    whole ``z`` map costs the dynamics objective nothing (the decoder rotates with it).
-    That is why each segment also carries ``anchors[i]``: the segment-final posterior mean
-    the encoder assigned it, used by
-    :meth:`AmortisedCOINPPOAgent._update_encoder` as a self-supervised pin. ``push_ids[i]``
-    is the value of :attr:`n_seen` at push time, which is how
-    :meth:`AmortisedCOINPPOAgent._settle_anchors` tells a still-arriving task's segments
-    (free to move) from settled ones (pinned).
     """
 
     def __init__(self, capacity: int = 128):
         self.capacity = int(capacity)
         self.buffer: List[torch.Tensor] = []
-        self.anchors: List[float] = []   # segment-final z when it settled; nan while free
-        self.push_ids: List[int] = []    # n_seen at push, i.e. the segment's arrival order
         self.group_ids: List[int] = []   # segments known to share a task; see push()
         self.n_seen = 0                  # segments pushed since the last length change
 
@@ -2781,25 +2721,14 @@ class SegmentReplayBuffer:
     def clear(self) -> None:
         """Empty the pool and restart the reservoir count."""
         self.buffer.clear()
-        self.anchors.clear()
-        self.push_ids.clear()
         self.group_ids.clear()
         self.n_seen = 0
 
-    def push(self, feats: torch.Tensor, anchor: Optional[float] = None,
-             group: Optional[int] = None) -> None:
-        """Store one segment's features, its code anchor and its group under Algorithm R.
-
-        ``anchor`` is the encoder's CURRENT segment-final posterior mean for this segment,
-        computed by the caller under ``no_grad``; ``None`` stores ``nan``, which
-        :meth:`AmortisedCOINPPOAgent._update_encoder` reads as "not anchored".
+    def push(self, feats: torch.Tensor, group: Optional[int] = None) -> None:
+        """Store one segment's features and its group under Algorithm R.
 
         ``group`` marks segments the CALLER knows came from the same task, without saying
-        which task -- the label-free "two views of one thing" that
-        :meth:`AmortisedCOINPPOAgent._dispersion_loss` needs to tell within-task spread from
-        between-task spread. ``None`` gives the segment a group of its own, which makes
-        every group a singleton and the invariance term identically zero, so a caller that
-        cannot make the guarantee simply gets the old behaviour.
+        which task; ``None`` gives the segment a group of its own.
 
         A change of segment length empties the pool (and restarts the reservoir count):
         :meth:`ContingencyEncoder.prefix_posterior` needs one common length.
@@ -2807,12 +2736,9 @@ class SegmentReplayBuffer:
         feats = feats.detach().cpu()
         if self.buffer and self.buffer[-1].shape[0] != feats.shape[0]:
             self.clear()
-        a = float("nan") if anchor is None else float(anchor)
         g = int(self.n_seen) if group is None else int(group)
         if len(self.buffer) < self.capacity:
             self.buffer.append(feats)
-            self.anchors.append(a)
-            self.push_ids.append(self.n_seen)
             self.group_ids.append(g)
         else:
             # j uniform on [0, n_seen]; the reservoir keeps the new segment with
@@ -2820,148 +2746,16 @@ class SegmentReplayBuffer:
             j = int(np.random.randint(0, self.n_seen + 1))
             if j < self.capacity:
                 self.buffer[j] = feats
-                self.anchors[j] = a
-                self.push_ids[j] = self.n_seen
                 self.group_ids[j] = g
         self.n_seen += 1
 
-    def sample_balanced(self, n_segments: int, recent_window: int):
-        """
-        ``(feats, anchors)`` with HALF the draw taken from the newest ``recent_window``
-        segments and half uniformly from the whole reservoir.
-
-        A uniform draw from a reservoir gives a task a share of the gradient equal to its
-        share of the STREAM SO FAR. On the Figure-3 blocked curriculum that is ruinous for
-        whoever arrives last: by the CartPole block the pool is ~90% earlier tasks, so the
-        gradient that has to carve out a CartPole-vs-Inverted-CartPole distinction arrives
-        at roughly a tenth of the strength it would have under joint training -- where the
-        same encoder separates that pair perfectly well.
-
-        Reserving half the minibatch for the newest segments guarantees every task a fixed
-        gradient share for as long as it is arriving, whatever the pool composition. It
-        needs no task labels and no boundaries: "newest" is a property of the reservoir's
-        own arrival counter, which is why it is safe here. The uniform half still covers the
-        whole stream, so the anchor keeps seeing (and holding) the old codes.
-
-        Falls back to a plain uniform draw when the pool has too few recent segments.
-        """
-        n = len(self.buffer)
-        if n == 0:
-            raise RuntimeError("empty replay pool")
-        want = int(n_segments)
-        cutoff = self.n_seen - int(recent_window)
-        recent = [i for i in range(n) if self.push_ids[i] >= cutoff]
-
-        n_recent = min(len(recent), want // 2)
-        idx: List[int] = []
-        if n_recent:
-            pick = torch.randperm(len(recent))[:n_recent]
-            idx += [recent[int(i)] for i in pick]
-        rest = [i for i in range(n) if i not in set(idx)]
-        need = min(want - len(idx), len(rest))
-        if need > 0:
-            pick = torch.randperm(len(rest))[:need]
-            idx += [rest[int(i)] for i in pick]
-
-        feats = torch.cat([self.buffer[i] for i in idx])
-        anchors = torch.tensor([self.anchors[i] for i in idx], dtype=torch.float32)
-        return feats, anchors
-
-    def code_clusters(self, gap: float):
-        """
-        Single-linkage clusters of the SETTLED segments by stamped code, as a list of index
-        lists. One dimension makes this exact and free: sort the stamped values and cut
-        wherever consecutive ones differ by more than ``gap``.
-
-        Label-free by construction -- it reads only the codes the encoder itself stamped,
-        never a task id. Unsettled (``nan``) segments are excluded; they are not anchored.
-        """
-        idx = [i for i in range(len(self.buffer)) if np.isfinite(self.anchors[i])]
-        if not idx:
-            return []
-        idx.sort(key=lambda i: self.anchors[i])
-        out, cur = [], [idx[0]]
-        for prev, i in zip(idx, idx[1:]):
-            if self.anchors[i] - self.anchors[prev] > float(gap):
-                out.append(cur)
-                cur = []
-            cur.append(i)
-        out.append(cur)
-        return out
-
-    def sample_code_groups(self, n_segments: int, gap: float, per_group: int = 2):
-        """
-        ``(feats, anchors)`` drawn CLUSTER-STRATIFIED over stamped codes.
-
-        The centroid anchor needs several members of one code cluster in the same minibatch
-        to have a centroid to speak of; a uniform draw of four from a pool of hundreds
-        almost never supplies them, and the penalty then silently degenerates to the
-        per-segment form it is meant to replace. Draws ``per_group`` segments from each of
-        ``n_segments // per_group`` randomly chosen clusters, and tops up uniformly when
-        there are too few settled segments.
-        """
-        clusters = self.code_clusters(gap)
-        want = int(n_segments)
-        idx: List[int] = []
-        if clusters:
-            n_g = max(1, want // int(per_group))
-            pick = torch.randperm(len(clusters))[:n_g]
-            for c in pick:
-                members = clusters[int(c)]
-                take = torch.randperm(len(members))[:int(per_group)]
-                idx += [members[int(t)] for t in take]
-        if len(idx) < want:
-            rest = [i for i in range(len(self.buffer)) if i not in set(idx)]
-            need = min(want - len(idx), len(rest))
-            if need > 0:
-                take = torch.randperm(len(rest))[:need]
-                idx += [rest[int(t)] for t in take]
-        if not idx:
-            raise RuntimeError("empty replay pool")
-        feats = torch.cat([self.buffer[i] for i in idx])
-        anchors = torch.tensor([self.anchors[i] for i in idx], dtype=torch.float32)
-        return feats, anchors
-
-    def sample_groups(self, n_groups: int, per_group: int = 2):
-        """
-        ``(feats, anchors, group_index)`` drawn GROUP-WISE: ``n_groups`` distinct groups,
-        up to ``per_group`` segments from each.
-
-        The structured draw the VICReg terms need -- a plain uniform sample of four
-        segments from a pool of hundreds almost never contains two members of one group, so
-        a within-group statistic computed on it would be undefined nearly every step.
-        ``group_index`` is 0-based and contiguous over the groups actually drawn, so it can
-        index a scatter directly. Groups with a single member still contribute to the
-        between-group statistic; they just carry no within-group variance.
-        """
-        by_group: Dict[int, List[int]] = defaultdict(list)
-        for i, g in enumerate(self.group_ids):
-            by_group[g].append(i)
-        keys = list(by_group)
-        if not keys:
-            raise RuntimeError("empty replay pool")
-        chosen = [keys[int(i)] for i in torch.randperm(len(keys))[:int(n_groups)]]
-
-        idx, gidx = [], []
-        for k, g in enumerate(chosen):
-            members = by_group[g]
-            take = torch.randperm(len(members))[:int(per_group)]
-            for t in take:
-                idx.append(members[int(t)])
-                gidx.append(k)
-        feats = torch.cat([self.buffer[i] for i in idx])
-        anchors = torch.tensor([self.anchors[i] for i in idx], dtype=torch.float32)
-        return feats, anchors, torch.tensor(gidx, dtype=torch.long)
-
     def sample(self, n_segments: int):
-        """``(feats, anchors)``: ``[n * L, in_dim]`` segment-major features sampled
-        uniformly without replacement, and the matching ``[n]`` float32 anchors."""
+        """``[n * L, in_dim]`` segment-major features sampled uniformly without
+        replacement."""
         if not self.buffer:
             raise RuntimeError("sample from an empty SegmentReplayBuffer")
         idx = torch.randperm(len(self.buffer))[:int(n_segments)]
-        feats = torch.cat([self.buffer[int(i)] for i in idx])
-        anchors = torch.tensor([self.anchors[int(i)] for i in idx], dtype=torch.float32)
-        return feats, anchors
+        return torch.cat([self.buffer[int(i)] for i in idx])
 
 
 class AmortisedCOINPPOAgent(COINPPOAgent):
@@ -3003,57 +2797,11 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         replay_capacity (int): Size of the encoder's :class:`SegmentReplayBuffer`, in
             segments. The pool is a reservoir, so it stays a uniform sample of the whole
             stream rather than a window on the newest block.
-        anchor_mode (str): Which stability penalty the stamped anchor applies --
-            ``"value"`` (default, pin each code), ``"centroid"`` (pin each code cluster's
-            mean, leaving symmetric local splits free) or ``"distance"`` (one-sided hinge
-            against contraction plus a translation term). See :meth:`_anchor_penalty`.
-        anchor_group_gap (float): Single-linkage gap that separates two code clusters, used
-            by the ``"centroid"`` mode. A few times the motor-noise floor: codes closer
-            than this are ones COIN could not tell apart anyway.
-        decoder_arch (str): ``"concat"`` (default) feeds ``[s, a, z]`` to one MLP;
-            ``"film"`` uses :class:`FiLMDecoder`, ``f(s, a) + z * g(s, a)``, which removes
-            most of the gauge freedom the code anchors were fighting -- see that class.
-        film_normalise (bool): For ``decoder_arch="film"``, fix the norm of ``g``'s output
-            layer, closing the residual affine gauge ``z -> a*z, g -> g/a``.
         decoder_lr_ratio (float): Decoder learning rate is ``encoder_lr / this``. Above one
             it slows the decoder relative to the encoder, so the decoder can no longer
             chase a relabelled latent as fast as the encoder can relabel it -- gauge
             control at the source rather than a penalty on the codes. ``1.0`` reproduces
             the single-rate behaviour exactly.
-        balanced_replay (bool): Draw half of every encoder minibatch from the newest
-            ``anchor_window`` segments and half uniformly from the reservoir
-            (:meth:`SegmentReplayBuffer.sample_balanced`). Off by default. Addresses
-            reservoir dilution: under a uniform draw a late-arriving task's gradient share
-            equals its share of the stream so far, which on the blocked curriculum leaves
-            the CartPole pair a fraction of the signal that separates it under joint
-            training. Task-agnostic -- "newest" comes from the reservoir's arrival counter,
-            not from any label or boundary.
-        anchor_ema_tau (Optional[float]): Set this to run the anchor in **EMA-teacher**
-            mode, the standard continual-self-supervised form: a trailing copy of the
-            encoder is kept as ``theta_ema <- tau * theta_ema + (1 - tau) * theta`` after
-            every optimiser step, and the anchor target for a replayed segment is that
-            teacher's code for the same segment, recomputed each step under ``no_grad``.
-
-            This is the mode to prefer, and not only on results. The stamping alternative
-            needs ``anchor_warmup`` to outlast the first task's learning, and the only
-            value that worked was one calibrated to the length of the MountainCar block --
-            task-boundary information smuggled into a method whose headline claim is that
-            it is given none. ``tau`` is a generic timescale with no task content: the
-            teacher trails from step 0, so no early code is ever frozen, and drift is
-            RATE-LIMITED rather than forbidden. In this mode ``anchor_window``,
-            ``anchor_warmup`` and the stored per-segment stamps are all inert.
-        anchor_coef (float): Weight of the **code-stability anchor** on replayed segments
-            (see :meth:`_update_encoder`). Zero reproduces the unanchored objective. The
-            dynamics MSE runs at ``1e-5`` to ``1e-3``, so the term is doing real work well
-            below one; the default is the encoder-only study's pick at
-            ``anchor_window = 64``, where ``0.3`` drifts a little more (0.025) with a wider
-            map and ``3.0`` starts to flatten it.
-        anchor_window (int): A pooled segment carries NO anchor while it is among the last
-            ``anchor_window`` segments pushed; beyond that its code is stamped once and
-            pinned. Counted in segments, so ``8 * n_rollouts``. Pin late, pin right: on the
-            shrunken stream, widening it from 32 to 64 segments both cut the drift (0.23 ->
-            0.06) and widened the separation (0.57 -> 0.93), because a code stamped before
-            it has settled leaves a residual force that then drags it anyway.
         value_coef (float): Weight of the **value-gradient encoder term**. Revives the
             original pre-dynamics training signal (see the b3dfced docstring for why it
             was once dropped): per segment, responsibilities are recomputed
@@ -3065,8 +2813,8 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             sole objective -- but that is exactly where ``L_dyn`` is strong; and it is
             NONZERO wherever different heads value the same states differently, which is
             exactly where ``L_dyn`` goes blind (state-identifiable task pairs, and
-            on-policy action-support divergence: the pilot's rail collapse). The two
-            terms are complements, not alternatives. Zero (default) disables it.
+            on-policy action-support divergence). The two terms are complements, not
+            alternatives. Zero (default) disables it.
         observe_value (bool): COIN observes ``(z, mean episodic return)`` as a 2-D
             vector instead of ``z`` alone, via realtimecoin's MD pipeline. Performance
             becomes part of what a context IS: an arriving task that parks at an
@@ -3095,58 +2843,6 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         value_process_noise (float): Documented per-trial drift budget for the value
             dimension; read by the notebook when building the 2-D COIN (the agent
             itself never constructs COIN models).
-        episodic_value_steps (bool): Take one value-gradient encoder step at EVERY
-            completed episode inside the rollout, instead of the single per-rollout
-            step. Each finished episode supplies realized raw return-to-go targets
-            for its own states; the routing posterior is the segment's prefix
-            posterior UP TO that step -- exactly the evidence an eval episode would
-            hold at the same point, so every call rehearses the evaluation
-            condition. The budget scales with the value evidence that actually
-            arrived, and lands inside the arrival window where the crash errors
-            live -- the measured ~0.005/step force gets tens of steps per rollout
-            instead of one. Capped at ``value_step_cap`` per segment (early
-            CartPole finishes ~25 episodes per segment). Requires
-            ``value_coef > 0``. Default off.
-        value_step_cap (int): Episode-triggered value steps allowed per segment.
-        value_pi_source (str): Prior for the episodic value steps' responsibilities:
-            ``"predicted"`` uses COIN's current predicted pi (matches training
-            routing); ``"stationary"`` uses the stationary prior evaluation starts
-            from -- the eval-faithful variant, which keeps an established rival
-            context competing at a shared code all block long, so the value error
-            (and hence the z-separating gradient) persists until the z-marginal
-            alone routes correctly instead of dying once COIN's richer prior fixes
-            routing.
-        repel_coef (float): Weight of the **value-surprise repulsion** -- the objective
-            fix for head-level parking. The mixture-form value term
-            (``value_coef``) is a boundary refiner: its gradient carries a
-            ``w(1 - w)`` factor, so it vanishes whenever routing is CONFIDENT --
-            including confidently wrong, which is exactly what parking produces (an
-            arriving task at an established context's centre). This term uses the
-            same value evidence through a path with no saturation: when the routed
-            context is ESTABLISHED and its head's value error on a segment explodes
-            past ``repel_gate_ratio`` times that context's running baseline
-            ("massive now, was not before"), the segment's code is pushed a full
-            ``repel_margin`` away from that context's centre via
-            ``relu(margin - |z - mu_c|)^2`` inside :meth:`_update_encoder` -- direct
-            distance geometry, full per-rollout step budget, no alternative head
-            required. A newborn context has no baseline, so the gate structurally
-            cannot fire on it: a fresh head's large error is expected learning, not
-            surprise. Zero (default) disables everything.
-        repel_margin (float | None): Push-to distance for the repulsion hinge; None
-            (default) uses ``2 * z_channel_noise`` -- one channel-enforced slot -- or
-            ``0.4 * z_scale`` when the channel is off.
-        repel_gate_ratio (float): Value-error blow-up factor over the context's
-            baseline that flags a segment as mis-parked.
-        vloss_ema_tau (float): EMA rate of the per-context value-error baseline;
-            updated only on NON-flagged segments so the anomaly cannot poison the
-            baseline it is measured against.
-        rail_coef (float): Weight of the **rail hinge** keeping codes out of the tanh
-            saturation zone: ``relu(|mean| / z_scale - 0.8)^2`` on segment-final means.
-            The raw-z pilot showed the rails are a code graveyard -- tanh' vanishes
-            there, so neither the dynamics loss nor the value-gradient term can ever
-            move a saturated code again, and arriving tasks park on it (CP and Mirror
-            both froze at +2). The hinge is zero on 80% of the range, so it costs
-            legitimate spread nothing. Zero (default) disables it.
         encoder_reward (bool): Insert the RAW step reward into the encoder features
             (layout ``(s, a, r, s')``) and add a reward-prediction head to the decoder
             -- reward is a decoder TARGET, never a decoder input (an input would revive
@@ -3158,69 +2854,11 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             between its shaped training stream and its raw evaluation. Note for the
             paper: this grants the encoder reward-as-context, the concession the
             recurrent-PPO baseline already enjoys.
-        decoder_residual (bool): The decoder predicts the state CHANGE and the model
-            adds it back: ``s' = s + f_psi(s, a, z)`` (dt folded into ``f``). Standard
-            stabiliser for learned dynamics -- the identity map is the zero function, so
-            an untrained decoder starts as "nothing changes" instead of an arbitrary
-            state, and the network models the (small, contingency-carrying) per-step
-            delta rather than reproducing the (large) state.
-        quantile_readout (bool): COIN observes ``probit(rank(z))`` -- the code's rank
-            within a re-encoded replay-buffer subsample, mapped through the inverse
-            normal CDF -- instead of raw ``z``. The rank is the maximal invariant of the
-            scalar gauge group (any invertible relabelling of a scalar latent is
-            monotone, and monotone maps preserve order), so a context's observed address
-            survives every warp of the code axis that the decoder can absorb; the
-            encoder-only study measured a 30-300x drift reduction over raw ``z``, with
-            the z-score readout (affine-only invariance) refuted in between. The probit
-            makes the observed population approximately standard normal and keeps the
-            observation unbounded, which is what COIN's Gaussian observation model
-            expects. Posterior sd is pushed through the same map (half the transformed
-            ``z +- sd`` interval). Until the buffer holds 8 segments the transform is
-            the identity -- the handful of trials COIN sees in raw space sit at the very
-            start of the first block and are re-contextualised within a few rollouts.
-        quantile_pop_size (int): Buffer segments re-encoded per refresh to form the rank
-            population. Subsampling adds ~``0.1`` within-task-sd of observation jitter
-            at 64; it shrinks as ``1/sqrt(n)``.
-        z_channel_noise (float): Extra noise sd added in quadrature to the posterior sd
-            when sampling ``z`` for the decoder during :meth:`_update_encoder` -- a noisy
-            channel between encoder and decoder. With it, two contexts whose codes sit
-            within the noise radius are indistinguishable to the decoder, so where their
-            dynamics actually differ the dynamics loss itself pushes the codes at least
-            one noise radius apart; contexts with identical dynamics may still merge,
-            which costs nothing downstream. Set it to the resolution COIN needs (its
-            sensory-noise floor) so the encoder is trained against the same metric COIN
-            classifies with. Zero (default) reproduces the plain objective.
-        disp_coef (float): Weight of the **dispersion** term (see :meth:`_update_encoder`).
-            Zero disables it. The anchor makes codes stationary but cannot make them
-            distinct: measured across four configurations, once the map stops drifting a
-            new task simply parks on an old code, because parking is what the dynamics loss
-            prefers. This is the term that asks for separation.
-        disp_target_sd (float): Standard deviation of the per-group code means that the
-            dispersion hinge aims for. Five well-spread codes in ``[-z_scale, z_scale]``
-            have ``sd ~ 0.63 * z_scale``, so ``1.0`` is a modest target at ``z_scale = 2``.
-        inv_coef (float): Weight of the within-group invariance term. Without it the
-            variance hinge is bought with within-task code noise rather than between-task
-            separation -- measured, not hypothesised (see :meth:`_dispersion_loss`).
-        disp_per_group (int): Segments drawn per group by
-            :meth:`SegmentReplayBuffer.sample_groups`. Two is enough for a within-group
-            variance and keeps the encoder minibatch at ``2 * mb_segments``.
         same_task_rollout (bool): The caller guarantees that all segments of one
             :meth:`train_step` call come from the SAME task, so they may share a replay
             group. True for the Figure-3 blocked harness (eight envs of one task per call);
             it MUST stay False for the interleaved mode, where every segment is a different
             task.
-        anchor_warmup (int): Segments to push before pinning starts at all. Below it every
-            anchor is cleared each update, so the objective is exactly the unanchored one.
-
-            **The default is 0, and deliberately so.** A non-zero warm-up has to be long
-            enough to outlast the first task's own learning, and the only value that worked
-            on the blocked stream was one calibrated to the MountainCar block's length --
-            task-boundary information smuggled into a method whose headline claim is that
-            it is given none. The encoder-only study showed the warm-up is not needed:
-            ``anchor_window`` alone (a generic "segments of new data before a code counts as
-            settled" timescale, carrying no task information) reaches a post-block drift of
-            0.008 with settled-code velocity 0.004, inside the 0.01 motor-noise floor, while
-            still letting the map separate.
         **kwargs: Forwarded to :class:`COINPPOAgent`.
     """
 
@@ -3228,120 +2866,46 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                  encoder_lr: float = 3e-4, enc_grad_clip: Optional[float] = 1.0,
                  z_scale: float = 0.15, prior_sd: float = 1.0, avoid_novel: bool = True,
                  kl_coef: float = 1e-3, replay_capacity: int = 128,
-                 dyn_obs_norm: bool = False, anchor_coef: float = 1.0,
-                 anchor_window: int = 64, anchor_warmup: int = 0,
-                 disp_coef: float = 0.0, disp_target_sd: float = 1.0,
-                 inv_coef: float = 0.0, disp_per_group: int = 2,
                  same_task_rollout: bool = False,
-                 anchor_ema_tau: Optional[float] = None,
-                 balanced_replay: bool = False, anchor_mode: str = "value",
-                 anchor_group_gap: float = 0.05,
-                 anchor_strat_sampling: Optional[bool] = None,
-                 decoder_arch: str = "concat", film_normalise: bool = False,
-                 decoder_lr_ratio: float = 1.0, z_channel_noise: float = 0.0,
-                 quantile_readout: bool = False, quantile_pop_size: int = 64,
-                 value_coef: float = 0.0, decoder_residual: bool = False,
-                 encoder_reward: bool = False, rail_coef: float = 0.0,
-                 repel_coef: float = 0.0, repel_margin: Optional[float] = None,
-                 repel_gate_ratio: float = 4.0, vloss_ema_tau: float = 0.9,
+                 decoder_lr_ratio: float = 1.0,
+                 value_coef: float = 0.0, encoder_reward: bool = False,
                  observe_value: bool = False, value_obs_scale: float = 200.0,
                  value_obs_noise_floor: float = 0.05,
                  value_process_noise: float = 0.01,
-                 episodic_value_steps: bool = False, value_step_cap: int = 4,
-                 value_pi_source: str = "predicted",
                  **kwargs):
         super().__init__(env, ctx_ids, **kwargs)
         self.z_scale, self.prior_sd = float(z_scale), float(prior_sd)
         self.avoid_novel, self.kl_coef = bool(avoid_novel), float(kl_coef)
-        self.dyn_obs_norm = bool(dyn_obs_norm)
         self.enc_grad_clip = enc_grad_clip
-        self.anchor_coef = float(anchor_coef)
-        self.anchor_window = int(anchor_window)
-        self.anchor_warmup = int(anchor_warmup)
-        self.anchor_ema_tau = None if anchor_ema_tau is None else float(anchor_ema_tau)
-        self.balanced_replay = bool(balanced_replay)
-        if anchor_mode not in ("value", "centroid", "distance"):
-            raise ValueError(f"anchor_mode must be value/centroid/distance, got {anchor_mode!r}")
-        self.anchor_mode = str(anchor_mode)
-        self.anchor_group_gap = float(anchor_group_gap)
-        # Cluster-stratified draws are ON by default only for the centroid form, which
-        # needs them. Set explicitly to control for the sampling change on its own.
-        self.anchor_per_group = 2      # members drawn per code cluster; see _update_encoder
-        self.anchor_strat_sampling = (self.anchor_mode == "centroid"
-                                      if anchor_strat_sampling is None
-                                      else bool(anchor_strat_sampling))
-        self.z_channel_noise = float(z_channel_noise)
-        self.quantile_readout = bool(quantile_readout)
-        self.quantile_pop_size = int(quantile_pop_size)
         self.value_coef = float(value_coef)
-        self.decoder_residual = bool(decoder_residual)
         self.encoder_reward = bool(encoder_reward)
-        self.rail_coef = float(rail_coef)
-        self.episodic_value_steps = bool(episodic_value_steps)
-        self.value_step_cap = int(value_step_cap)
-        if value_pi_source not in ("predicted", "stationary"):
-            raise ValueError(f"value_pi_source must be predicted/stationary, "
-                             f"got {value_pi_source!r}")
-        self.value_pi_source = str(value_pi_source)
-        self.repel_coef = float(repel_coef)
-        self.repel_margin = None if repel_margin is None else float(repel_margin)
-        self.repel_gate_ratio = float(repel_gate_ratio)
-        self.vloss_ema_tau = float(vloss_ema_tau)
         self.observe_value = bool(observe_value)
         self.value_obs_scale = float(value_obs_scale)
         self.value_obs_noise_floor = float(value_obs_noise_floor)
         self.value_process_noise = float(value_process_noise)
-        self._vloss_ema: Dict[Any, float] = {}   # per-context value-error baseline
-        self._repel_batch: List[Tuple[torch.Tensor, float]] = []
-        self._code_pop: Optional[np.ndarray] = None   # sorted; see _refresh_code_population
-        self.disp_coef = float(disp_coef)
-        self.disp_target_sd = float(disp_target_sd)
-        self.inv_coef = float(inv_coef)
-        self.disp_per_group = int(disp_per_group)
         self.same_task_rollout = bool(same_task_rollout)
         self._group_counter = 0
         self.encoder = ContingencyEncoder(
             self.obs_dim, self.act_dim, self.action_continuous, hidden=encoder_hidden,
             z_scale=z_scale, prior_sd=prior_sd,
             use_reward=self.encoder_reward).to(self.device)
-        if decoder_arch not in ("concat", "film"):
-            raise ValueError(f"decoder_arch must be concat/film, got {decoder_arch!r}")
-        self.decoder_arch = str(decoder_arch)
         sa_dim = self.obs_dim + self.act_dim
         # With encoder_reward the decoder PREDICTS the reward as one extra output --
         # never receives it as input, which would hand back the identify-from-anything-
         # but-z shortcut the on-policy pilot exposed. Predicting it makes reward
         # differences one more thing only a well-placed z can explain.
         dec_out = self.obs_dim + (1 if self.encoder_reward else 0)
-        if self.decoder_arch == "film":
-            if self.encoder_reward:
-                raise ValueError("encoder_reward supports decoder_arch='concat' only")
-            self.decoder = FiLMDecoder(sa_dim, self.obs_dim, encoder_hidden,
-                                       normalise=bool(film_normalise)).to(self.device)
-        else:
-            self.decoder = _MLP(sa_dim + 1, dec_out, encoder_hidden).to(self.device)
+        self.decoder = _MLP(sa_dim + 1, dec_out, encoder_hidden).to(self.device)
 
-        # Decoder-side gauge control (C1-C3). The dynamics loss is invariant to any smooth
-        # relabelling of z that the decoder can absorb, so slowing, anchoring or freezing
-        # the DECODER removes the freedom at its source instead of penalising the codes --
-        # which is what made the code anchors oppose pair separation.
         self.decoder_lr_ratio = float(decoder_lr_ratio)
 
         # Deliberately NOT in self._all_optimizers(): the encoder is trained by the dynamics
         # objective alone, and the PPO step must not touch it. Two param groups so the
-        # decoder can be slowed (C1) or stopped (C3) without touching the encoder.
+        # decoder can be slowed without touching the encoder.
         self.enc_optim = optim.Adam(
             [{"params": list(self.encoder.parameters()), "lr": float(encoder_lr)},
              {"params": list(self.decoder.parameters()),
               "lr": float(encoder_lr) / max(self.decoder_lr_ratio, 1e-12)}])
-        # EMA teacher: a trailing copy of the encoder that never receives gradients and is
-        # never optimised. Built only in EMA mode, so the stamp path costs nothing.
-        self.encoder_ema: Optional[ContingencyEncoder] = None
-        if self.anchor_ema_tau is not None:
-            self.encoder_ema = copy.deepcopy(self.encoder).to(self.device)
-            for prm in self.encoder_ema.parameters():
-                prm.requires_grad_(False)
-            self.encoder_ema.eval()
 
         self.replay = SegmentReplayBuffer(replay_capacity)
         # The episode a segment stopped in, kept on the agent so a rollout boundary is no
@@ -3401,34 +2965,16 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         """``(predicted s', predicted reward or None)`` from ``(s, a_repr, z)``.
 
         The reward column of ``feats`` (encoder_reward layout ``(s, a, r, s')``) is an
-        encoder input and a decoder TARGET, never a decoder input; the residual form
-        applies to the state head only."""
+        encoder input and a decoder TARGET, never a decoder input."""
         sa = feats[:, :self.obs_dim + self.act_dim]
-        if self.decoder_arch == "film":
-            out = self.decoder(sa, z)
-        else:
-            out = self.decoder(torch.cat([sa, z.unsqueeze(-1)], dim=-1))
+        out = self.decoder(torch.cat([sa, z.unsqueeze(-1)], dim=-1))
         r_hat = out[:, -1] if self.encoder_reward else None
-        s_hat = out[:, :self.obs_dim]
-        if self.decoder_residual:
-            s_hat = feats[:, :self.obs_dim] + s_hat
-        return s_hat, r_hat
+        return out[:, :self.obs_dim], r_hat
 
     def _dyn_loss(self, feats: torch.Tensor, z: torch.Tensor,
                   seg_len: Optional[int] = None) -> torch.Tensor:
-        """Dynamics MSE, per-SEGMENT per-dimension normalised when :attr:`dyn_obs_norm`.
-
-        Raw-unit MSE lets large-scale dimensions (positions, O(1)) drown the small-scale
-        ones (velocities) that carry most of the contingency signal -- MountainCar's
-        amplitude term is O(1e-3) in raw velocity units, invisible next to an O(1)
-        position residual. And because the padded interface makes tasks SHARE dimensions
-        (MountainCar's velocity is CartPole's cart velocity at ~100x the scale), no single
-        global per-dimension weighting can serve every task at once. Each residual is
-        therefore scaled by the std of its dimension's per-step change ``s' - s`` computed
-        WITHIN ITS OWN SEGMENT -- segments are single-task, so every task's dynamics get
-        O(1) salience in their own frame. Dimensions that do not move within a segment
-        (interface padding) carry no dynamics information there and are masked out.
-        """
+        """Raw dynamics MSE on ``s'``, plus the reward-prediction MSE when the decoder
+        carries a reward head (``encoder_reward``)."""
         obs_dim = self.obs_dim
         target = feats[:, -obs_dim:]
         s_hat, r_hat = self._decode_full(feats, z)
@@ -3436,15 +2982,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         r_term = 0.0
         if r_hat is not None:
             r_term = (r_hat - feats[:, self.obs_dim + self.act_dim]).pow(2).mean()
-        if not self.dyn_obs_norm:
-            return err.pow(2).mean() + r_term
-        L = int(seg_len) if seg_len else int(feats.shape[0])
-        S = feats.shape[0] // L
-        delta = (target - feats[:, :obs_dim]).view(S, L, obs_dim)
-        sd = delta.std(dim=1, unbiased=False).detach()             # [S, obs_dim]
-        active = (sd > 1e-8).float()
-        e = err.view(S, L, obs_dim) / sd.clamp_min(1e-3).unsqueeze(1) * active.unsqueeze(1)
-        return e.pow(2).sum() / (active.sum() * L).clamp_min(1.0) + r_term
+        return err.pow(2).mean() + r_term
 
     def _segment_features(self, obs, act, next_obs, rew=None) -> torch.Tensor:
         """Stack one segment's stored transitions into encoder features ``[L, in_dim]``.
@@ -3560,202 +3098,10 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
     # ------------------------------------------------------------------
     # Encoder / decoder training
     # ------------------------------------------------------------------
-    def _anchor_penalty(self, z_new: torch.Tensor,
-                        stamped: torch.Tensor) -> torch.Tensor:
-        """
-        The stability penalty for a minibatch's SETTLED codes, in one of three forms.
-
-        ``z_new`` are the differentiable segment-final codes under the current encoder;
-        ``stamped`` the values the encoder assigned when those segments settled. Both are
-        already filtered to the settled subset.
-
-        * ``"value"`` -- ``mean (z_new - stamped)^2``. Pins every code where it was. It is
-          what made the map stationary, and it is also what made the CartPole pair
-          impossible: separating CP from Inverted CP requires exactly the local movement
-          this forbids. Measured under joint training, switching it on collapses the pair
-          from 14.9 to 0.0 pooled sd.
-        * ``"centroid"`` -- clusters the settled codes by stamped proximity
-          (:attr:`anchor_group_gap`, single-linkage in one dimension) and pins each
-          CLUSTER'S MEAN. A symmetric split of a cluster moves its members apart while its
-          centroid stays, so the penalty is zero; a sweep moves centroids and is charged in
-          full. Structure, not values.
-        * ``"distance"`` -- a ONE-SIDED hinge on pairwise distances,
-          ``mean relu(d_stamped - d_new)^2``, plus ``(mean z_new - mean stamped)^2`` to
-          forbid bodily translation. Contraction of any pair is charged; EXPANSION is free,
-          because a split is an expansion. The translation term is what stops the map
-          escaping the hinge by drifting as a rigid whole.
-
-          It is STRICTER than the centroid form on the very move we want. Splitting a
-          cluster inside a wider set pushes one member TOWARD the neighbouring cluster, so
-          although the split itself expands, the cross-pair contracts and is charged.
-          Splitting ``[-1, -1]`` of ``[-1, -1, 1, 1]`` by +-0.09 costs one charged pair in
-          six, where the centroid form costs exactly nothing.
-
-        All three read only the encoder's own stamps -- no labels, no boundaries.
-        """
-        if z_new.numel() == 0:
-            return z_new.new_zeros(())
-        if self.anchor_mode == "value":
-            return (z_new - stamped).pow(2).mean()
-
-        if self.anchor_mode == "centroid":
-            order = torch.argsort(stamped)
-            zs, an = z_new[order], stamped[order]
-            if zs.numel() == 1:
-                return (zs - an).pow(2).mean()
-            cuts = ((an[1:] - an[:-1]) > self.anchor_group_gap).long()
-            gid = torch.cat([cuts.new_zeros(1), torch.cumsum(cuts, 0)])
-            new_mu, _ = self._group_stats(zs, gid)
-            old_mu, _ = self._group_stats(an, gid)
-            return (new_mu - old_mu).pow(2).mean()
-
-        # distance
-        trans = (z_new.mean() - stamped.mean()).pow(2)
-        if z_new.numel() < 2:
-            return trans
-        iu = torch.triu_indices(z_new.numel(), z_new.numel(), offset=1)
-        d_new = (z_new[:, None] - z_new[None, :]).abs()[iu[0], iu[1]]
-        d_old = (stamped[:, None] - stamped[None, :]).abs()[iu[0], iu[1]]
-        return torch.relu(d_old - d_new).pow(2).mean() + trans
-
-    def _update_ema_teacher(self) -> None:
-        """
-        ``theta_ema <- tau * theta_ema + (1 - tau) * theta``, over parameters AND buffers.
-
-        Called after every optimiser step. Runs under ``no_grad`` and writes in place, so
-        the teacher is a pure function of the student's history and can never contribute a
-        gradient. Buffers are copied rather than mixed only if they are non-floating
-        (integer counters); the encoder has none today, but a future normalisation layer
-        would.
-        """
-        if self.encoder_ema is None:
-            return
-        tau = self.anchor_ema_tau
-        with torch.no_grad():
-            for p_ema, p in zip(self.encoder_ema.parameters(), self.encoder.parameters()):
-                p_ema.mul_(tau).add_(p.detach(), alpha=1.0 - tau)
-            for b_ema, b in zip(self.encoder_ema.buffers(), self.encoder.buffers()):
-                if b_ema.dtype.is_floating_point:
-                    b_ema.mul_(tau).add_(b.detach(), alpha=1.0 - tau)
-                else:
-                    b_ema.copy_(b)
-
-    def _settle_anchors(self, seg_len: int, chunk: int = 32) -> int:
-        """
-        Stamp the code of every pooled segment that has just stopped being new, clear the
-        anchor of every segment that is still new, and return how many are still free.
-
-        A segment is **free** -- ``anchors[i] = nan``, contributing nothing to the anchor
-        term -- in two cases, both for the same reason: an anchor is worth keeping only
-        once it means something.
-
-        * **Warm-up** (``replay.n_seen <= anchor_warmup``): every segment. During the first
-          block there is one task and the map is still organising, so the codes assigned
-          then are arbitrary; pinning them would fix an accident, and worse, would pin
-          early segments collected under an untrained policy, which for MountainCar are
-          nearly indistinguishable from Flat MountainCar and would drag the two together.
-          With every anchor nan the objective is exactly the unanchored one.
-        * **Still arriving** (``push_id >= n_seen - anchor_window``): the newest segments.
-          A task that has just appeared must be free to claim its own region of ``z``
-          without paying for the move, and a policy that is still improving keeps changing
-          what its own task's segments look like.
-
-        Freeing rather than re-stamping is load-bearing. Re-stamping a fresh segment every
-        call turns the anchor into a slew-rate limit on the WHOLE map, and a new task can
-        then migrate no faster than an old one may drift -- measured on the shrunken
-        stream, that is a coefficient with no good setting (stable enough to hold
-        MountainCar means Acrobot never leaves it). With the newest segments carrying no
-        anchor at all, the only thing resisting a new code is the requirement that the
-        SETTLED ones do not move with it, which is exactly the constraint wanted.
-
-        Once a segment falls out of the window it is stamped with the code it has then --
-        which is also what stops a mid-block sweep of the CURRENT task, not only drift of
-        the tasks whose blocks are over. Stamping is a forward pass only (``no_grad``, no
-        RNG), so it cannot change the parameters or the seeded random stream, and it
-        touches each segment once.
-        """
-        if self.encoder_ema is not None:
-            return 0            # EMA mode: the teacher IS the target; nothing is stamped
-        replay = self.replay
-        n = len(replay)
-        if n == 0:
-            return 0
-        if replay.n_seen <= self.anchor_warmup:
-            free = set(range(n))
-        elif self.anchor_window > 0:
-            cutoff = replay.n_seen - self.anchor_window
-            free = {i for i in range(n) if replay.push_ids[i] >= cutoff}
-        else:
-            free = set()
-
-        for i in free:
-            replay.anchors[i] = float("nan")
-        todo = [i for i in range(n)
-                if i not in free and not np.isfinite(replay.anchors[i])]
-
-        with torch.no_grad():
-            for start in range(0, len(todo), int(chunk)):
-                part = todo[start:start + int(chunk)]
-                feats = torch.cat([replay.buffer[i] for i in part]).to(self.device)
-                mean, _ = self.encoder.prefix_posterior(feats, seg_len)
-                for j, i in enumerate(part):
-                    replay.anchors[i] = float(mean[j, -1])
-        return len(free)
-
-    def _group_stats(self, z_final: torch.Tensor, gidx: torch.Tensor):
-        """``(group_means, within_group_var)`` for codes labelled by contiguous ``gidx``."""
-        n_g = int(gidx.max().item()) + 1
-        counts = torch.zeros(n_g, device=z_final.device).index_add_(
-            0, gidx, torch.ones_like(z_final))
-        sums = torch.zeros(n_g, device=z_final.device).index_add_(0, gidx, z_final)
-        means = sums / counts.clamp_min(1.0)
-        dev2 = (z_final - means[gidx]).pow(2)
-        within = torch.zeros(n_g, device=z_final.device).index_add_(0, gidx, dev2)
-        return means, within / counts.clamp_min(1.0)
-
-    def _dispersion_loss(self, z_final: torch.Tensor,
-                         gidx: Optional[torch.Tensor] = None):
-        """
-        VICReg's variance and invariance terms on segment codes, returned as
-        ``(dispersion, invariance)``.
-
-        The variance term (Bardes, Ponce & LeCun, ICLR 2022) is a HINGE,
-        ``relu(disp_target_sd - std(.))^2``: once the codes reach the stated spread its
-        gradient is exactly zero, so it buys separation up to a scale and then stops
-        pulling -- it never fights the anchor for more. The invariance term is the mean
-        within-group variance, which is what makes the hinge mean the right thing.
-
-        **The hinge alone is exploitable, and measured on the random-action proxy it is
-        exploited immediately.** Asked for spread with no notion of which segments belong
-        together, the encoder buys variance the cheapest way available: it makes the code
-        NOISY on the tasks whose dynamics it cannot tell apart (MountainCar and Flat
-        MountainCar reached a within-task code spread of 1.0 and 1.7 respectively, against
-        0.007 unpenalised), because a code the decoder cannot use anyway is free to
-        randomise. Between-task separation in units of the pooled sd got worse, not better.
-
-        So the spread is asked of the GROUP MEANS -- segments the caller has marked as one
-        task (:meth:`SegmentReplayBuffer.push`) -- while the within-group variance is
-        penalised. Between-task dispersion is then the only route to satisfying the hinge.
-        With no grouping every group is a singleton: the invariance term is identically
-        zero and the hinge falls back to the plain, exploitable form.
-
-        Fewer than two groups carries no variance information and contributes nothing.
-        """
-        if gidx is None:
-            means, within = z_final, z_final.new_zeros(z_final.shape)
-        else:
-            means, within = self._group_stats(z_final, gidx)
-        if means.numel() < 2:
-            return z_final.new_zeros(()), within.mean()
-        disp = torch.relu(self.disp_target_sd - means.std()).pow(2)
-        return disp, within.mean()
-
     def _update_encoder(self, seg_len: int, enc_steps: int,
                         mb_segments: int) -> Dict[str, float]:
         """
-        Fit encoder and decoder on
-        ``L_dyn + kl_coef * KL + anchor_coef * L_anchor + disp_coef * L_disp``,
-        minibatched over SEGMENTS.
+        Fit encoder and decoder on ``L_dyn + kl_coef * KL``, minibatched over SEGMENTS.
 
         Each gradient step draws ``mb_segments`` segments from :attr:`replay` and uses all
         of their transitions -- a prefix posterior is a whole-segment quantity, so a
@@ -3764,123 +3110,26 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         so a cached one would go stale immediately) and resampled with fresh noise. Prefix
         column ``t`` is the posterior BEFORE transition ``t``, so the latent the decoder
         sees never contains the transition it has to predict.
-
-        **The anchor is what makes the code stationary.** Nothing in ``L_dyn`` prefers one
-        labelling of the latent over another: the decoder can absorb any smooth
-        reparameterisation of ``z``, so each block's on-policy data is free to rotate the
-        whole map, and it does -- faster than COIN's drift tracking can follow, which
-        spawns spurious contexts and misroutes the tasks whose blocks are over. The anchor
-        term
-
-            ``L_anchor = mean_over_pinned_segments( (z_final(seg) - anchor[seg])^2 )``
-
-        makes the encoder its own teacher. There are two ways to supply ``anchor[seg]``:
-
-        * **EMA teacher** (``anchor_ema_tau`` set, preferred). The target is a trailing
-          copy of the encoder evaluated on the same segments,
-          ``theta_ema <- tau * theta_ema + (1 - tau) * theta``. Nothing is stored and
-          nothing is frozen: the student may move the map as fast as the teacher follows,
-          which converts an unbounded rotation into a bounded VELOCITY. Being a pure
-          timescale, ``tau`` carries no task information -- the property the stamping mode
-          could not honour.
-        * **Stamped** (default). ``anchor[seg]`` is the value the encoder itself assigned
-          when the segment settled (:meth:`_settle_anchors`); segments still inside
-          ``anchor_window`` carry none. This is the mode that WORKS, and the reason is that
-          it is SELECTIVE: it conditions on a segment's age, so it can hold an old code
-          still while leaving a newly arrived task completely free. The EMA teacher cannot
-          make that distinction -- it rate-limits the whole map at once -- and measured on
-          the encoder-only study it trades drift against spread along a single curve with
-          no usable point on it.
-
-        Either way: no labels, no cues, and the supervision comes entirely from the model's
-        own past.
-
-        **The anchor alone is not enough.** Stationary is not the same as distinct, and
-        across four measured configurations the tasks that a stable map merges stay
-        merged: parking a new task on an old code costs the dynamics loss nothing, so it
-        parks. ``L_disp`` (:meth:`_dispersion_loss`) is the missing half -- a hinge that
-        asks the batch of codes to reach a stated spread and then stops. Anchor and
-        dispersion are complementary, not competing: one forbids old codes from moving,
-        the other requires the population to spread, and the only way to satisfy both is
-        to move the NEW code away.
         """
         clip = float("inf") if self.enc_grad_clip is None else float(self.enc_grad_clip)
-        dyn_val = kl_val = grad_norm = anchor_val = float("nan")
-
-        n_free = self._settle_anchors(seg_len)
-
-        # The variance hinge is meaningless while the pool holds a single task: asking a
-        # one-task population to spread IS a demand for within-task spread, and on the
-        # random-action proxy the hinge was satisfied that way by rollout 4-13, deep inside
-        # the first block, locking the damage in before anything was pinned. The warm-up
-        # boundary is exactly "the first block is over", so it gates both.
-        structured = (self.disp_coef > 0.0 or self.inv_coef > 0.0)
-        dispersing = structured and self.replay.n_seen > self.anchor_warmup
+        dyn_val = kl_val = grad_norm = float("nan")
 
         for _ in range(int(enc_steps)):
-            if structured:
-                feats, anchors, gidx = self.replay.sample_groups(mb_segments,
-                                                                 self.disp_per_group)
-                gidx = gidx.to(self.device)
-            elif self.anchor_strat_sampling:
-                # The centroid form needs cluster-mates in the same batch to have a
-                # centroid at all; see SegmentReplayBuffer.sample_code_groups.
-                feats, anchors = self.replay.sample_code_groups(
-                    mb_segments, self.anchor_group_gap, self.anchor_per_group)
-                gidx = None
-            elif self.balanced_replay:
-                feats, anchors = self.replay.sample_balanced(mb_segments,
-                                                             self.anchor_window)
-                gidx = None
-            else:
-                feats, anchors = self.replay.sample(mb_segments)
-                gidx = None
-            feats = feats.to(self.device)
-            anchors = anchors.to(self.device)
+            feats = self.replay.sample(mb_segments).to(self.device)
             mean, sd = self.encoder.prefix_posterior(feats, seg_len)
-            sd_z = sd[:, :-1]
-            if self.z_channel_noise > 0.0:
-                # Noisy channel: the decoder must work at COIN's resolution, so codes
-                # closer than the noise radius are confusable and differing dynamics
-                # push them apart through the dynamics loss itself.
-                sd_z = torch.sqrt(sd_z ** 2 + self.z_channel_noise ** 2)
-            z = (mean[:, :-1] + torch.randn_like(sd_z) * sd_z).reshape(-1)
+            z = (mean[:, :-1] + torch.randn_like(sd[:, :-1]) * sd[:, :-1]).reshape(-1)
 
             dyn = self._dyn_loss(feats, z, seg_len)
             kl = self._kl_to_prior(mean, sd).mean()
-            # nan anchors mark segments pushed without one (pre-anchor pools, or a caller
-            # that passed None); they are simply not pinned.
-            z_final = mean[:, -1]
-            if self.encoder_ema is not None:
-                # EMA mode: the target is the trailing teacher's code for these very
-                # segments, recomputed every step under no_grad. Nothing is stored, so no
-                # code is ever frozen and no boundary information is consulted.
-                with torch.no_grad():
-                    t_mean, _ = self.encoder_ema.prefix_posterior(feats, seg_len)
-                anchor = (z_final - t_mean[:, -1]).pow(2).mean()
-            else:
-                ok = torch.isfinite(anchors)
-                anchor = self._anchor_penalty(z_final[ok], anchors[ok])
-            disp, inv = self._dispersion_loss(z_final, gidx)
-            rail = torch.relu(z_final.abs() / self.z_scale - 0.8).pow(2).mean()
-            loss = (dyn + self.kl_coef * kl + self.anchor_coef * anchor
-                    + (self.disp_coef * disp if dispersing else 0.0)
-                    + self.inv_coef * inv + self.rail_coef * rail)
-            if self._repel_batch:
-                loss = loss + self.repel_coef * self._repel_hinge(seg_len)
+            loss = dyn + self.kl_coef * kl
 
             self.enc_optim.zero_grad()
             loss.backward()
             grad_norm = float(nn.utils.clip_grad_norm_(self.encoder.parameters(), clip))
             self.enc_optim.step()
-            self._update_ema_teacher()
             dyn_val, kl_val = float(dyn.item()), float(kl.item())
-            anchor_val, disp_val = float(anchor.item()), float(disp.item())
-            inv_val = float(inv.item())
 
-        return {"dyn_loss": dyn_val, "encoder_kl": kl_val, "enc_grad_norm": grad_norm,
-                "anchor_loss": anchor_val, "anchor_free": float(n_free),
-                "disp_loss": disp_val, "inv_loss": inv_val}
+        return {"dyn_loss": dyn_val, "encoder_kl": kl_val, "enc_grad_norm": grad_norm}
 
     def pretrain_encoder(self, envs, seg_steps: int = 512, n_iters: int = 50,
                          enc_steps: int = 32, mb_segments: int = 4) -> Dict[str, np.ndarray]:
@@ -3896,8 +3145,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
 
         Returns:
             Dict[str, np.ndarray]: Per-iteration ``dyn_loss``, ``encoder_kl``,
-            ``enc_grad_norm``, ``anchor_loss``, ``anchor_free``, ``disp_loss`` and
-            ``inv_loss``.
+            ``enc_grad_norm``.
         """
         L = int(seg_steps)
         history: Dict[str, List[float]] = defaultdict(list)
@@ -3916,219 +3164,14 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                         next_obs, _ = env.reset()
                     obs_t = self._flatten_obs(next_obs)
                 feats = self._segment_features(obs, act, nxt)
-                with torch.no_grad():
-                    mean_p, _ = self.encoder.prefix_posterior(feats, L)
                 # No group: pretrain passes one env per TASK, so this loop's segments are
                 # deliberately NOT the same task.
-                self.replay.push(feats, float(mean_p[0, -1]))
+                self.replay.push(feats)
 
             for key, val in self._update_encoder(L, enc_steps, mb_segments).items():
                 history[key].append(val)
 
         return {k: np.asarray(v, dtype=float) for k, v in history.items()}
-
-    # ------------------------------------------------------------------
-    # Quantile readout (gauge-invariant observation space for COIN)
-    # ------------------------------------------------------------------
-    def _refresh_code_population(self, seg_len: Optional[int] = None) -> None:
-        """Re-encode a replay subsample and cache its sorted segment-final codes.
-
-        Called once per :meth:`train_step` and once per :meth:`evaluate_identifying`, so
-        every observation within one trial batch shares one population -- and the
-        population always reflects the CURRENT encoder, which is what makes the rank
-        cancel gauge motion (stale push-time codes would not move with the map).
-        No-op unless :attr:`quantile_readout`; population stays ``None`` below 8 segments.
-        """
-        if not self.quantile_readout:
-            return
-        n = len(self.replay)
-        if n < 8:
-            self._code_pop = None
-            return
-        if seg_len is None:
-            seg_len = int(self.replay.buffer[0].shape[0])
-        idx = np.random.choice(n, size=min(self.quantile_pop_size, n), replace=False)
-        feats = torch.cat([self.replay.buffer[i] for i in idx]).to(self.device)
-        with torch.no_grad():
-            mean, _ = self.encoder.prefix_posterior(feats, int(seg_len))
-        self._code_pop = np.sort(mean[:, -1].cpu().numpy())
-
-    def _obs_transform(self, z: float, sd: float) -> Tuple[float, float]:
-        """Map an ``(z, sd)`` code posterior into COIN's observation space.
-
-        Identity without :attr:`quantile_readout` (or before a population exists).
-        Otherwise ``z -> probit(midrank(z))`` with quantiles clamped to
-        ``[1/2n, 1 - 1/2n]`` (the resolution an ``n``-point population supports), and the
-        sd mapped as half the transformed ``z +- sd`` interval, floored at ``1e-3`` so a
-        code beyond the population's edge never claims certainty.
-        """
-        pop = self._code_pop
-        if pop is None:
-            return float(z), float(sd)
-        from statistics import NormalDist
-        n = pop.size
-        inv = NormalDist().inv_cdf
-
-        def probit(x):
-            lo = float(np.searchsorted(pop, x, side="left"))
-            hi = float(np.searchsorted(pop, x, side="right"))
-            q = np.clip((lo + hi) / (2.0 * n), 0.5 / n, 1.0 - 0.5 / n)
-            return inv(q)
-
-        z_obs = probit(z)
-        sd_obs = max((probit(z + sd) - probit(z - sd)) / 2.0, 1e-3)
-        return z_obs, sd_obs
-
-    def _soft_obs_transform(self, z: torch.Tensor, sd: torch.Tensor):
-        """Differentiable twin of :meth:`_obs_transform` for the value-gradient term.
-
-        The hard rank is piecewise constant (zero gradient a.e.), so the encoder could
-        never feel the value loss through it. A smooth ECDF -- mean of sigmoids with a
-        bandwidth tied to the population spread -- keeps the same map at scale while
-        letting the gradient through; COIN itself still receives the exact transform.
-        """
-        pop = self._code_pop
-        if pop is None:
-            return z, sd
-        pop_t = torch.as_tensor(pop, dtype=z.dtype, device=z.device)
-        n = pop_t.numel()
-        h = max(float(pop.std()), 1e-3) * 0.1
-
-        def probit(x):
-            q = torch.sigmoid((x - pop_t) / h).mean()
-            q = q.clamp(0.5 / n, 1.0 - 0.5 / n)
-            return torch.special.ndtri(q)
-
-        z_obs = probit(z)
-        sd_obs = ((probit(z + sd) - probit(z - sd)) / 2.0).clamp_min(1e-3)
-        return z_obs, sd_obs
-
-    def _flag_value_surprise(self, seg_feats, seg_rho, seg_ctx, obs_tensor,
-                             ret_tensor, seg_len: int):
-        """Fill :attr:`_repel_batch` with segments whose routed head mis-values them.
-
-        Per segment: take COIN's dominant post-observation context; if it is a known,
-        instantiated, ESTABLISHED context (has a value-error baseline from previous
-        segments), compare its head's value MSE on this segment against
-        ``repel_gate_ratio *`` that baseline. A blow-up flags the segment for
-        repulsion away from the context's centre ``mu_c`` (stored with its features
-        for :meth:`_update_encoder`); an ordinary error updates the baseline EMA.
-        The novel column and contexts born this very rollout are never flagged.
-        """
-        self._repel_batch = []
-        if self.repel_coef <= 0.0:
-            return 0
-        L = int(seg_len)
-        flagged = 0
-        with torch.no_grad():
-            for s, feats_s in enumerate(seg_feats):
-                rho = np.asarray(seg_rho[s], dtype=float)
-                if not np.isfinite(rho).any():
-                    continue
-                j = int(np.nanargmax(rho))
-                ctx_mu, _ctx_var, _f2 = seg_ctx[s]
-                k = len(ctx_mu) - 1
-                if j >= k or j >= self.num_contexts - 1:
-                    continue                      # novel, or born after the ctx query
-                cid = self.context_keys[j]
-                if self.context_init.get(cid, 0) == 0:
-                    continue
-                obs_s = obs_tensor[s * L:(s + 1) * L]
-                ret_s = ret_tensor[s * L:(s + 1) * L]
-                err = float(((self.nets[cid][2](obs_s).squeeze(-1) - ret_s) ** 2
-                             ).mean())
-                base = self._vloss_ema.get(cid)
-                if base is None:
-                    self._vloss_ema[cid] = err     # first sight: baseline, no gate
-                elif err > self.repel_gate_ratio * max(base, 1e-8):
-                    # MD contexts carry (z, value) centres; repulsion acts on z.
-                    mu_j = float(np.asarray(ctx_mu[j]).reshape(-1)[0])
-                    self._repel_batch.append((feats_s.detach().cpu(), mu_j))
-                    flagged += 1
-                else:
-                    tau = self.vloss_ema_tau
-                    self._vloss_ema[cid] = tau * base + (1.0 - tau) * err
-        return flagged
-
-    def _repel_hinge(self, seg_len: int) -> torch.Tensor:
-        """Repulsion loss for the flagged segments, summed; zero tensor when none."""
-        margin = self.repel_margin
-        if margin is None:
-            margin = (2.0 * self.z_channel_noise if self.z_channel_noise > 0.0
-                      else 0.4 * self.z_scale)
-        total = torch.zeros((), device=self.device)
-        for feats, mu_c in self._repel_batch:
-            mean, _ = self.encoder.prefix_posterior(feats.to(self.device),
-                                                    int(seg_len))
-            d = (mean[0, -1] - mu_c).abs()
-            total = total + torch.relu(margin - d).pow(2)
-        return total
-
-    def _episodic_value_step(self, obs_ep, rtg_ep, feats_so_far, pi_agent,
-                             ctx_mu, ctx_var, floor2) -> Optional[float]:
-        """One encoder value-gradient step from a single completed episode.
-
-        ``feats_so_far`` is the current segment's transitions up to the episode's
-        final step; its full-prefix posterior is the routing evidence available at
-        that moment. Responsibilities are rebuilt differentiably (torch twin of
-        :meth:`_step_context_weights`, z-dim centres), the heads' DETACHED values on
-        the episode's states are mixed under them and scored against the realized
-        raw return-to-go. Returns the loss value, or None when no usable weights.
-        """
-        L = int(feats_so_far.shape[0])
-        mean, sd = self.encoder.prefix_posterior(feats_so_far.to(self.device), L)
-        z_t, sd_t = self._soft_obs_transform(mean[0, -1], sd[0, -1])
-
-        k = len(ctx_mu) - 1
-        mu = np.asarray(ctx_mu, dtype=float)
-        if mu.ndim > 1:
-            mu = mu[:, 0]                       # MD contexts: z-dim centres
-        var = np.asarray(ctx_var, dtype=float)
-        if var.ndim > 1:
-            var = var[:, 0]
-        mu_t = torch.as_tensor(mu, dtype=z_t.dtype, device=z_t.device)
-        var_t = (torch.as_tensor(var, dtype=z_t.dtype, device=z_t.device)
-                 + sd_t * sd_t + floor2)
-        ll = -0.5 * ((z_t - mu_t) ** 2 / var_t + torch.log(var_t))
-        like = torch.exp(ll - ll.max().detach())
-        pi_t = torch.as_tensor(np.nan_to_num(np.asarray(pi_agent, dtype=float),
-                                             nan=0.0),
-                               dtype=z_t.dtype, device=z_t.device)
-        w = torch.zeros(self.num_contexts, dtype=z_t.dtype, device=z_t.device)
-        w[:k] = pi_t[:k] * like[:k]
-        w[-1] = pi_t[-1] * like[-1]
-        total = w.sum()
-        if not torch.isfinite(total) or float(total) <= 0.0:
-            return None
-        w = w / total
-
-        obs_t = torch.stack(obs_ep).to(self.device)
-        rtg_t = torch.as_tensor(rtg_ep, dtype=torch.float32, device=self.device)
-        with torch.no_grad():
-            v_heads = torch.zeros(self.num_contexts, obs_t.shape[0],
-                                  device=self.device)
-            for j, cid in enumerate(self.context_keys):
-                if self.context_init.get(cid, 0) == 0:
-                    continue
-                v_heads[j] = self.nets[cid][2](obs_t).squeeze(-1)
-        v_mixed = (w.unsqueeze(1) * v_heads).sum(dim=0)
-        loss = (v_mixed - rtg_t).pow(2).mean()
-        if not torch.isfinite(loss):
-            return None
-
-        self.enc_optim.zero_grad()
-        (self.value_coef * loss).backward()
-        # A single non-finite gradient would poison every parameter through the
-        # clip's total-norm; skip the step instead of stepping into NaN.
-        for p in self.encoder.parameters():
-            if p.grad is not None and not torch.isfinite(p.grad).all():
-                self.enc_optim.zero_grad()
-                return None
-        clip = (float("inf") if self.enc_grad_clip is None
-                else float(self.enc_grad_clip))
-        nn.utils.clip_grad_norm_(self.encoder.parameters(), clip)
-        self.enc_optim.step()
-        return float(loss.item())
 
     def _encoder_value_loss(self, seg_feats, seg_pi, seg_ctx, obs_tensor,
                             ret_tensor, seg_len: int):
@@ -4157,7 +3200,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                 ctx_mu, ctx_var = ctx_mu[:, 0], ctx_var[:, 0]
             k = len(ctx_mu) - 1
             mean, sd = self.encoder.prefix_posterior(feats_s.to(self.device), L)
-            z_t, sd_t = self._soft_obs_transform(mean[0, -1], sd[0, -1])
+            z_t, sd_t = mean[0, -1], sd[0, -1]
 
             mu_t = torch.as_tensor(ctx_mu, dtype=z_t.dtype, device=z_t.device)
             var_t = (torch.as_tensor(ctx_var, dtype=z_t.dtype, device=z_t.device)
@@ -4235,10 +3278,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             max acting weight exceeds 0.9; ``nan`` if never),
             ``mean_episode_return`` (``nan`` where no episode ENDED in that segment), plus
             scalar ``mean_reward_per_step``, ``value_loss``, ``policy_loss``, ``dyn_loss``,
-            ``encoder_kl``, ``enc_grad_norm``, ``anchor_loss`` (the code-stability term,
-            see :meth:`_update_encoder`), ``anchor_free`` (pooled segments still allowed
-            to move their code), ``disp_loss`` (the separation hinge) and ``inv_loss``
-            (the within-task consistency term).
+            ``encoder_kl`` and ``enc_grad_norm``.
         """
         S, L = len(envs), int(seg_steps)
         enc, W = self.encoder, self.num_contexts
@@ -4248,13 +3288,9 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         # would assert the exact opposite of the truth.
         self._group_counter += 1
         group = self._group_counter if self.same_task_rollout else None
-        # One rank population per rollout: every COIN observation and step-level
-        # comparison in this call shares the same observation space.
-        self._refresh_code_population(L)
         store: Dict[str, List[Any]] = defaultdict(list)
         seg_feats, seg_w, seg_w_final, seg_last_obs, seg_returns = [], [], [], [], []
         seg_z, seg_z_sd, seg_K, seg_pi, seg_rho, seg_ctx = [], [], [], [], [], []
-        n_ep_vsteps = 0     # episode-triggered value-gradient steps this rollout
 
         # ---------- 1. interleaved rollout ----------
         for s, env in enumerate(envs):
@@ -4291,7 +3327,6 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             # episode's pre-boundary raw sum is unknown; carry_state is False in the
             # Figure-3 protocol, where this is exact.)
             ep_ret_raw, ep_raw_returns = 0.0, []
-            ep_start, seg_vsteps, pi_val = 0, 0, None
 
             for _ in range(L):
                 with torch.no_grad():
@@ -4324,11 +3359,9 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                 eta2 += iv
                 eta1 += float(mu_f) * iv
                 var_t = 1.0 / (eta2 + prior_prec)
-                # The posterior lives in z-space; the comparison against COIN's context
-                # Gaussians happens in observation space (quantile-probit when enabled).
-                z_t, sd_t = self._obs_transform(eta1 * var_t, float(np.sqrt(var_t)))
                 w_t = self._policy_weights(self._step_context_weights(
-                    pi_agent, z_t, sd_t, ctx_mu, ctx_var, floor2))
+                    pi_agent, eta1 * var_t, float(np.sqrt(var_t)),
+                    ctx_mu, ctx_var, floor2))
 
                 ep_ret += reward
                 ep_ret_raw += frew[-1]
@@ -4336,27 +3369,8 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                     next_obs, _ = env.reset()
                     ep_returns.append(ep_ret)
                     ep_raw_returns.append(ep_ret_raw)
-                    if (self.episodic_value_steps and self.value_coef > 0.0
-                            and update_encoder and seg_vsteps < self.value_step_cap):
-                        # One value step per completed episode: realized raw
-                        # return-to-go targets, routing from the segment's prefix
-                        # so far -- the evidence an eval episode would hold here.
-                        rtg = np.cumsum(frew[ep_start:][::-1])[::-1].copy()
-                        if self.value_pi_source == "stationary":
-                            if pi_val is None:
-                                pi_val = self._eval_prior_pi(coin, min(K, W - 1))
-                        else:
-                            pi_val = pi_agent
-                        v = self._episodic_value_step(
-                            obs[ep_start:], rtg,
-                            self._segment_features(obs, act, nxt, rew=frew),
-                            pi_val, ctx_mu, ctx_var, floor2)
-                        if v is not None:
-                            seg_vsteps += 1
-                            n_ep_vsteps += 1
                     ep_ret = 0.0
                     ep_ret_raw = 0.0
-                    ep_start = len(obs)
                 obs_t = self._flatten_obs(next_obs)
 
             seg_w_final.append(w_t)
@@ -4380,14 +3394,12 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
 
             with torch.no_grad():
                 mean_s, sd_s = enc.prefix_posterior(feats_s, L)
-            # The segment goes into the pool WITH the code the encoder just gave it: that
-            # value is its anchor from the moment it settles (:meth:`_settle_anchors`).
-            self.replay.push(feats_s, float(mean_s[0, -1]), group=group)
+            self.replay.push(feats_s, group=group)
             seg_z.append(float(mean_s[0, -1]))
             seg_z_sd.append(float(sd_s[0, -1]))
             # COIN's sensory noise for this trial IS the encoder's uncertainty; the pipeline
             # reads it fresh at every use and adds sigma_motor_noise (the floor) in quadrature.
-            z_obs, sd_obs = self._obs_transform(float(mean_s[0, -1]), float(sd_s[0, -1]))
+            z_obs, sd_obs = float(mean_s[0, -1]), float(sd_s[0, -1])
             if self.observe_value:
                 # Second observation dim: mean RAW return of the episodes that ENDED
                 # in this segment (nan when none did -- the MD pipeline masks that
@@ -4452,11 +3464,6 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         adv_tensor = ((adv - adv.mean()) / (adv.std() + 1e-8)).to(self.device).float()
         ret_tensor = torch.cat(ret_parts).to(self.device).float()
 
-        # Value-surprise gating runs BEFORE the PPO update: the routed head's error is
-        # sharpest before this rollout's minibatches co-adapt it to the new task.
-        n_repel = self._flag_value_surprise(seg_feats, seg_rho, seg_ctx,
-                                            obs_tensor, ret_tensor, L)
-
         # ---------- 3. PPO update (context heads only) ----------
         n = S * L
         actor_loss = critic_loss = None
@@ -4505,9 +3512,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                 dyn = self._dyn_loss(feats, z, L)
                 enc_stats = {"dyn_loss": float(dyn.item()),
                              "encoder_kl": float(self._kl_to_prior(mean, sd).mean().item()),
-                             "enc_grad_norm": 0.0, "anchor_loss": 0.0,
-                             "anchor_free": 0.0, "disp_loss": 0.0, "inv_loss": 0.0,
-                             "enc_value_loss": float("nan")}
+                             "enc_grad_norm": 0.0, "enc_value_loss": float("nan")}
 
         # ---------- 5. diagnostics ----------
         self._weights_version += 1
@@ -4522,8 +3527,6 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             "mean_episode_return": np.asarray(seg_returns, dtype=float),
             "mean_reward_per_step": float(np.mean(store["rew"])),
             "value_loss": float(critic_loss.item()), "policy_loss": float(actor_loss.item()),
-            "repel_flagged": float(n_repel),
-            "ep_value_steps": float(n_ep_vsteps),
             **enc_stats,
         }
 
@@ -4608,10 +3611,6 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             which head actually drove the episode).
         """
         W = self.num_contexts
-        # Same observation space as training: rank population from the current encoder.
-        # Re-encoding replay segments reads the buffer and the encoder; it advances
-        # neither, so the evaluation stays frozen.
-        self._refresh_code_population()
         # ---- read-only COIN queries, once per call ----
         k = min(int(coin.context_alignment()["K"]), W - 1)
         ctx_mu, ctx_var = self._segment_context_gaussians(coin, k)
@@ -4655,9 +3654,9 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                     eta2 += iv
                     eta1 += float(mu_f) * iv
                     var_t = 1.0 / (eta2 + prior_prec)
-                    z_t, sd_t = self._obs_transform(eta1 * var_t, float(np.sqrt(var_t)))
                     w_t = self._policy_weights(self._step_context_weights(
-                        pi_agent, z_t, sd_t, ctx_mu, ctx_var, floor2))
+                        pi_agent, eta1 * var_t, float(np.sqrt(var_t)),
+                        ctx_mu, ctx_var, floor2))
 
                     ep_ret += float(reward)
                     obs_t = next_t

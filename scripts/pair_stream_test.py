@@ -1,9 +1,9 @@
-﻿"""Parametrised miniature pair-stream test: task A block then task B block, 2-D
-stack + episodic value steps (stationary pi), expert-bootstrapped heads, per-rollout
-probe-code traces, and a post-stream evaluate_identifying (the real z-marginal eval)
-on both tasks. NOT a pilot -- a targeted probe of birth / z-divergence / eval routing
-for one task pair. Set FIG3_TASK4=gravflip in the environment to make task 4 the
-original InvertedCartPole.
+﻿"""Parametrised miniature pair-stream test: task A block then task B block on the
+minimal stack (2-D COIN observation + value term + reward features),
+expert-bootstrapped heads, per-rollout probe-code traces, and a post-stream
+evaluate_identifying (the real z-marginal eval) on both tasks. NOT a pilot -- a
+targeted probe of birth / z-divergence / eval routing for one task pair. Set
+FIG3_TASK4=gravflip in the environment to make task 4 the original InvertedCartPole.
 
 Usage: python pair_stream_test.py --tasks 3 4 --rollouts 50 --out e1.npz
 """
@@ -83,14 +83,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--tasks", type=int, nargs=2, default=[0, 2])
     ap.add_argument("--rollouts", type=int, default=50)
-    ap.add_argument("--anchor", type=float, default=0.0,
-                    help="stamped-anchor coef (w64/wu0); pins settled codes against "
-                         "the absent-context map slide E1/E2 exposed")
     ap.add_argument("--seed", type=int, default=0,
                     help="stream seed: seed_everything, COIN rng, rollout env seeds"
                          " (experts and probe/eval seeds stay fixed across arms)")
-    ap.add_argument("--value-pi-source", default="stationary",
-                    choices=["stationary", "predicted"])
     args = ap.parse_args()
 
     import torch
@@ -106,8 +101,7 @@ def main():
     MC, FLAT = A, B                       # probe/trace slots reuse the 10c naming
     BLOCKS = ((A, args.rollouts), (B, args.rollouts))
     print(f"pair: {f3.TASK_NAMES[A]} -> {f3.TASK_NAMES[B]}, "
-          f"{args.rollouts} rollouts each, seed {args.seed}, "
-          f"value_pi_source={args.value_pi_source}", flush=True)
+          f"{args.rollouts} rollouts each, seed {args.seed}", flush=True)
 
     t0 = time.perf_counter()
     experts = {t: pretrain_expert(t) for t in (MC, FLAT)}
@@ -116,12 +110,8 @@ def main():
     proto = f3.make_task_env(MC, None, 200)
     agent = AmortisedCOINPPOAgent(
         proto, CTX_IDS, z_scale=2.0, prior_sd=0.5, kl_coef=0.0,
-        encoder_lr=1.5e-4, replay_capacity=512,
-        anchor_coef=float(args.anchor), anchor_window=64, anchor_warmup=0,
-        rail_coef=1.0, z_channel_noise=0.4,
-        value_coef=1e-3, decoder_residual=True, encoder_reward=True,
-        observe_value=True, episodic_value_steps=True,
-        value_pi_source=args.value_pi_source,
+        encoder_lr=3e-4, replay_capacity=512,
+        value_coef=1e-3, encoder_reward=True, observe_value=True,
         same_task_rollout=True, **f3.PPO_KWARGS)
     proto.close()
     coin = RealTimeCOIN(rng=args.seed, sigma_motor_noise=0.05,
@@ -176,8 +166,8 @@ def main():
                 bad = [n for n, q in agent.encoder.named_parameters()
                        if not torch.isfinite(q).all()]
                 print(f"[NAN] first at rollout {i}: params {bad[:4]}; "
-                      f"dyn={r['dyn_loss']:.5f} vloss={r['enc_value_loss']} "
-                      f"vsteps={r['ep_value_steps']}", flush=True)
+                      f"dyn={r['dyn_loss']:.5f} vloss={r['enc_value_loss']}",
+                      flush=True)
             kpost[i] = int(coin.context_alignment()["K"])
             vsteps[i] = r.get("ep_value_steps", np.nan)
             pi_hist[i] = np.nanmean(r["pi"], axis=0)
