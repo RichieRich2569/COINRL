@@ -91,9 +91,6 @@ def main():
                          " (experts and probe/eval seeds stay fixed across arms)")
     ap.add_argument("--value-pi-source", default="stationary",
                     choices=["stationary", "predicted"])
-    ap.add_argument("--protect", action="store_true",
-                    help="protect_heads: value-surprise-flagged segments sit out "
-                         "the PPO update (detect-before-adapt at the head level)")
     args = ap.parse_args()
 
     import torch
@@ -124,7 +121,7 @@ def main():
         rail_coef=1.0, z_channel_noise=0.4,
         value_coef=1e-3, decoder_residual=True, encoder_reward=True,
         observe_value=True, episodic_value_steps=True,
-        value_pi_source=args.value_pi_source, protect_heads=bool(args.protect),
+        value_pi_source=args.value_pi_source,
         same_task_rollout=True, **f3.PPO_KWARGS)
     proto.close()
     coin = RealTimeCOIN(rng=args.seed, sigma_motor_noise=0.05,
@@ -146,6 +143,10 @@ def main():
     spread = np.full((n_total + 1, 2), np.nan)
     kpost = np.full(n_total, -1)
     vsteps = np.full(n_total, np.nan)
+    W = agent.num_contexts
+    pi_hist = np.full((n_total, W), np.nan)     # predicted pi (pre-evidence)
+    rho_hist = np.full((n_total, W), np.nan)    # post-observation responsibilities
+    wact_hist = np.full((n_total, W), np.nan)   # mean ACTING weights
     injected = set()
     code[0, 0], spread[0, 0] = encode(MC)
     code[0, 1], spread[0, 1] = encode(FLAT)
@@ -179,12 +180,20 @@ def main():
                       f"vsteps={r['ep_value_steps']}", flush=True)
             kpost[i] = int(coin.context_alignment()["K"])
             vsteps[i] = r.get("ep_value_steps", np.nan)
-            if i % 10 == 0:
+            pi_hist[i] = np.nanmean(r["pi"], axis=0)
+            rho_hist[i] = np.nanmean(np.asarray(r["rho"], dtype=float), axis=0)
+            wact_hist[i] = np.nanmean(r["w_mean"], axis=0)
+            if i % 10 == 0 or (task == FLAT and i - BLOCKS[0][1] < 6):
                 gap = abs(code[i + 1, 0] - code[i + 1, 1])
+                dom = int(np.nanargmax(wact_hist[i]))
                 print(f"[{i:>3}] task={f3.TASK_NAMES[task]:<15} "
                       f"z_mc={code[i + 1, 0]:+.3f} z_flat={code[i + 1, 1]:+.3f} "
                       f"gap={gap:.3f} K={kpost[i]} vsteps={vsteps[i]:.0f} "
-                      f"ret={np.nanmean(r['mean_episode_return']):.1f}", flush=True)
+                      f"ret={np.nanmean(r['mean_episode_return']):.1f} "
+                      f"act={dom}:{np.nanmax(wact_hist[i]):.2f} "
+                      f"pi={np.round(np.nan_to_num(pi_hist[i][:6]), 2)} "
+                      f"rho={np.round(np.nan_to_num(rho_hist[i][:6]), 2)}",
+                      flush=True)
             i += 1
 
     # ---- the real z-marginal eval: does identification separate the pair? ----
@@ -202,6 +211,7 @@ def main():
               f"head {eval_head[t]} (w={eval_w[t]:.2f})", flush=True)
 
     np.savez(args.out, code=code, spread=spread, kpost=kpost, vsteps=vsteps,
+             pi_hist=pi_hist, rho_hist=rho_hist, wact_hist=wact_hist,
              blocks=np.array(BLOCKS),
              eval_returns=np.array([eval_ret[MC], eval_ret[FLAT]]),
              eval_heads=np.array([eval_head[MC], eval_head[FLAT]]),

@@ -3095,18 +3095,6 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         value_process_noise (float): Documented per-trial drift budget for the value
             dimension; read by the notebook when building the 2-D COIN (the agent
             itself never constructs COIN models).
-        protect_heads (bool): Detect-before-adapt at the PPO level: segments flagged
-            by the value-surprise gate (routed to an ESTABLISHED context whose head's
-            value error explodes past its baseline) are EXCLUDED from this rollout's
-            PPO minibatches. Closes the arrival-window race the anchored miniature
-            exposed: without it, PPO heals a newcomer's return crash by retraining
-            the routed head within ~10-20 rollouts, which both erases COIN's novelty
-            evidence (delaying the birth) and corrupts the old head. With it, the
-            policy cannot adapt to a suspicious arrival, the crash persists
-            undiluted, the birth fires within rollouts, and training resumes on the
-            newborn's own head. The gate's asymmetries carry over: a newborn context
-            has no baseline, so its own learning is never suppressed. Works with or
-            without ``repel_coef``. Default off.
         episodic_value_steps (bool): Take one value-gradient encoder step at EVERY
             completed episode inside the rollout, instead of the single per-rollout
             step. Each finished episode supplies realized raw return-to-go targets
@@ -3260,7 +3248,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                  value_obs_noise_floor: float = 0.05,
                  value_process_noise: float = 0.01,
                  episodic_value_steps: bool = False, value_step_cap: int = 4,
-                 value_pi_source: str = "predicted", protect_heads: bool = False,
+                 value_pi_source: str = "predicted",
                  **kwargs):
         super().__init__(env, ctx_ids, **kwargs)
         self.z_scale, self.prior_sd = float(z_scale), float(prior_sd)
@@ -3295,8 +3283,6 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             raise ValueError(f"value_pi_source must be predicted/stationary, "
                              f"got {value_pi_source!r}")
         self.value_pi_source = str(value_pi_source)
-        self.protect_heads = bool(protect_heads)
-        self._flagged_segments: List[int] = []
         self.repel_coef = float(repel_coef)
         self.repel_margin = None if repel_margin is None else float(repel_margin)
         self.repel_gate_ratio = float(repel_gate_ratio)
@@ -4030,8 +4016,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         The novel column and contexts born this very rollout are never flagged.
         """
         self._repel_batch = []
-        self._flagged_segments = []
-        if self.repel_coef <= 0.0 and not self.protect_heads:
+        if self.repel_coef <= 0.0:
             return 0
         L = int(seg_len)
         flagged = 0
@@ -4056,11 +4041,9 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                 if base is None:
                     self._vloss_ema[cid] = err     # first sight: baseline, no gate
                 elif err > self.repel_gate_ratio * max(base, 1e-8):
-                    if self.repel_coef > 0.0:
-                        # MD contexts carry (z, value) centres; repulsion acts on z.
-                        mu_j = float(np.asarray(ctx_mu[j]).reshape(-1)[0])
-                        self._repel_batch.append((feats_s.detach().cpu(), mu_j))
-                    self._flagged_segments.append(s)
+                    # MD contexts carry (z, value) centres; repulsion acts on z.
+                    mu_j = float(np.asarray(ctx_mu[j]).reshape(-1)[0])
+                    self._repel_batch.append((feats_s.detach().cpu(), mu_j))
                     flagged += 1
                 else:
                     tau = self.vloss_ema_tau
@@ -4476,21 +4459,10 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
 
         # ---------- 3. PPO update (context heads only) ----------
         n = S * L
-        # protect_heads: transitions of value-surprise-flagged segments sit this
-        # update out, so a mis-parked arrival cannot retrain (and heal on) the head
-        # it was wrongly routed to -- the crash persists until COIN births.
-        pool = torch.arange(n)
-        if self.protect_heads and self._flagged_segments:
-            keep = torch.ones(n, dtype=torch.bool)
-            for s_flag in self._flagged_segments:
-                keep[s_flag * L:(s_flag + 1) * L] = False
-            if keep.any():
-                pool = pool[keep]
-        n_pool = int(pool.numel())
         actor_loss = critic_loss = None
         for _ in range(mini_epochs):
-            idxs = pool[torch.randperm(n_pool)]
-            for start in range(0, n_pool, mb_size):
+            idxs = torch.randperm(n)
+            for start in range(0, n, mb_size):
                 mb = idxs[start:start + mb_size]
                 b_obs, b_act, b_w = obs_tensor[mb], act_tensor[mb], w_all[mb]
 
