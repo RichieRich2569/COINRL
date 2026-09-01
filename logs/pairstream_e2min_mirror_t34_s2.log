@@ -1,0 +1,44 @@
+pair: CartPole -> MirrorCartPole, 50 rollouts each, seed 2
+[expert CartPole] final train return 200.0
+[expert MirrorCartPole] final train return 200.0
+F:\Projects\COINRL\rl.py:3217: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:837.)
+  if not torch.isfinite(total) or float(total) <= 0.0:
+[inject] rollout 0: head 0 <- CartPole expert
+F:\Projects\COINRL\scripts\pair_stream_test.py:173: RuntimeWarning: Mean of empty slice
+  pi_hist[i] = np.nanmean(r["pi"], axis=0)
+F:\Projects\COINRL\scripts\pair_stream_test.py:174: RuntimeWarning: Mean of empty slice
+  rho_hist[i] = np.nanmean(np.asarray(r["rho"], dtype=float), axis=0)
+[  0] task=CartPole        z_mc=+0.844 z_flat=+0.831 gap=0.013 K=1 vsteps=nan ret=15.7 act=0:1.00 pi=[0.97 0.   0.   0.   0.   0.  ] rho=[1. 0. 0. 0. 0. 0.]
+[inject] rollout 1: head 1 <- CartPole expert
+[inject] rollout 2: head 2 <- CartPole expert
+[inject] rollout 2: head 3 <- CartPole expert
+[ 10] task=CartPole        z_mc=+1.621 z_flat=+1.611 gap=0.010 K=4 vsteps=nan ret=200.0 act=2:1.00 pi=[0.01 0.03 0.93 0.03 0.   0.  ] rho=[0. 0. 1. 0. 0. 0.]
+[ 20] task=CartPole        z_mc=+1.714 z_flat=+1.708 gap=0.007 K=4 vsteps=nan ret=200.0 act=2:1.00 pi=[0.   0.01 0.97 0.02 0.   0.  ] rho=[0. 0. 1. 0. 0. 0.]
+[ 30] task=CartPole        z_mc=+1.748 z_flat=+1.744 gap=0.004 K=4 vsteps=nan ret=200.0 act=2:1.00 pi=[0.   0.01 0.98 0.01 0.   0.  ] rho=[0. 0. 1. 0. 0. 0.]
+[ 40] task=CartPole        z_mc=+1.773 z_flat=+1.771 gap=0.002 K=4 vsteps=nan ret=200.0 act=2:1.00 pi=[0.   0.01 0.99 0.01 0.   0.  ] rho=[0. 0. 1. 0. 0. 0.]
+[inject] rollout 50: head 4 <- MirrorCartPole expert
+[ 50] task=MirrorCartPole  z_mc=+1.881 z_flat=+1.880 gap=0.001 K=4 vsteps=nan ret=9.5 act=2:0.61 pi=[0.01 0.1  0.57 0.26 0.38 0.  ] rho=[0.   0.25 0.   0.62 1.   0.  ]
+[ 51] task=MirrorCartPole  z_mc=+1.937 z_flat=+1.937 gap=0.001 K=4 vsteps=nan ret=15.1 act=3:0.69 pi=[0.01 0.02 0.34 0.63 0.   0.  ] rho=[0. 0. 0. 1. 0. 0.]
+[ 52] task=MirrorCartPole  z_mc=+1.902 z_flat=+1.900 gap=0.002 K=4 vsteps=nan ret=19.9 act=3:0.97 pi=[0.01 0.01 0.25 0.73 0.   0.  ] rho=[0. 0. 0. 1. 0. 0.]
+[ 53] task=MirrorCartPole  z_mc=+1.933 z_flat=+1.930 gap=0.003 K=4 vsteps=nan ret=20.5 act=3:0.93 pi=[0.01 0.01 0.2  0.79 0.   0.  ] rho=[0. 0. 0. 1. 0. 0.]
+[inject] rollout 54: head 5 <- MirrorCartPole expert
+[ 54] task=MirrorCartPole  z_mc=+1.980 z_flat=+1.979 gap=0.001 K=6 vsteps=nan ret=15.0 act=3:0.52 pi=[0.01 0.03 0.37 0.53 0.03 0.33] rho=[0.   0.14 0.   0.73 0.   0.5 ]
+[ 55] task=MirrorCartPole  z_mc=+1.980 z_flat=+1.980 gap=0.001 K=6 vsteps=nan ret=45.1 act=2:0.59 pi=[0.01 0.12 0.4  0.05 0.24 0.18] rho=[0.   0.   0.12 0.   0.31 0.57]
+[ 60] task=MirrorCartPole  z_mc=+1.981 z_flat=+1.979 gap=0.002 K=5 vsteps=nan ret=111.4 act=4:0.31 pi=[0.07 0.04 0.51 0.1  0.23 0.06] rho=[0.12 0.   0.3  0.14 0.32 0.24]
+[inject] rollout 69: head 6 <- MirrorCartPole expert
+[inject] rollout 69: head 7 <- MirrorCartPole expert
+[inject] rollout 70: head 8 <- MirrorCartPole expert
+[ 70] task=MirrorCartPole  z_mc=+1.942 z_flat=+0.737 gap=1.205 K=8 vsteps=nan ret=24.1 act=1:0.30 pi=[0.11 0.17 0.3  0.08 0.07 0.07] rho=[0.15 0.25 0.   0.   0.   0.17]
+[inject] rollout 73: head 9 <- MirrorCartPole expert
+[ 80] task=MirrorCartPole  z_mc=+1.734 z_flat=-0.104 gap=1.837 K=10 vsteps=nan ret=114.3 act=9:0.47 pi=[0.05 0.31 0.15 0.03 0.05 0.01] rho=[0.   0.23 0.   0.   0.   0.  ]
+[ 90] task=MirrorCartPole  z_mc=+1.622 z_flat=-0.245 gap=1.867 K=10 vsteps=nan ret=172.1 act=9:0.40 pi=[0.04 0.25 0.05 0.01 0.01 0.08] rho=[0.   0.13 0.   0.   0.   0.12]
+[eval] CartPole        : return     9.5  head 2 (w=0.95)
+[eval] MirrorCartPole  : return   132.5  head 1 (w=0.85)
+
+gap at FlatMC arrival: 0.002   gap at end: 1.982   pooled probe sd: 0.008   d-prime end: 261.2
+F:\Projects\COINRL\scripts\pair_stream_test.py:217: RuntimeWarning: Mean of empty slice
+  f"{np.nanmean(vsteps[sw:]):.1f}")
+K final: 10   value steps/rollout (FlatMC block): nan
+PASS - divergence gate: gap_end > max(3*pooled_sd, gap_start+0.2)
+PASS - eval-separation gate: distinct dominant heads under z-marginal eval
