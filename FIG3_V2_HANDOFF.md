@@ -26,8 +26,26 @@ default stationary sd is only 0.027) and `FLOOR=0.05`. Known artefact: the *scal
 COIN pipeline's likelihood underflows beyond ~38σ surprise (linear-space pdf) —
 the MD path (used by `observe_value`) is immune.
 
-On machine 1, three single-delta pilots from the "pilot 7" reference stack are
-running: wide axis (crowding ablation), +repulsion, +2-D observation.
+Since the first handoff (machine-1 findings, all committed):
+
+- Single-delta pilots: wide axis FAILED (crowding relocates merges), undirected
+  repulsion FAILED (pushes codes into the tanh rail and pins them), **2-D
+  observation SUCCEEDED at train time** (first-ever five distinct contexts; CP and
+  Mirror on separate heads via the return-crash birth) but eval collapsed -- the
+  z-marginal cannot distinguish contexts whose codes stayed merged, and the value
+  channel is a TRANSIENT discriminator (ceilings coincide for mastered tasks).
+- New mechanisms since: `episodic_value_steps` (one value-gradient encoder step per
+  completed episode -- realized raw return-to-go targets, routing from the segment's
+  prefix-so-far = eval-rehearsal evidence, `value_pi_source="stationary"` keeps the
+  error signal alive so z diverges until the z-marginal alone routes; plus a
+  non-finite-gradient guard) and the raw-return fix for `observe_value` (shaped MC
+  returns had inflated its value coordinate ~+0.5).
+- STRATEGY CHANGE after the machine-2 crash: NO full pilots until miniatures pass.
+  `scripts/pair_stream_test.py` is the workhorse: a two-task block stream with
+  expert-bootstrapped heads (policy+value injected at context birth -- diagnostic
+  only), per-rollout probe-code traces, and a real `evaluate_identifying` stage,
+  ~1-2 h per run with explicit divergence and eval-separation gates printed at the
+  end.
 
 ## Setup
 
@@ -41,7 +59,26 @@ pip install -e "<path-to>/real_time_md_coin/python"
 python -m pytest test_rl.py -q     # expect 70 passed
 ```
 
-## Run matrix (priority order)
+## Run matrix v2 (post-crash, miniatures only — supersedes everything below)
+
+Machine 1 is already running: E1 = gravflip CP/InvCP pair miniature
+(`FIG3_TASK4=gravflip python scripts/pair_stream_test.py --tasks 3 4 --rollouts 50`),
+E2 = the Mirror twin (no env var), E3 = MC/FlatMC (`--tasks 0 2`), plus the one
+pre-existing full pilot 10b (raw-return verification). Machine 2 should take the
+**seed-robustness and coverage arms** of the same miniatures — everything is a
+1–2 h run:
+
+1. E1/E2/E3 at seeds 1 and 2 (edit `rl.seed_everything(0)` calls via a `--seed`
+   argument if you add one, or run as-is first to reproduce machine 1's seed 0).
+2. Remaining pairs at seed 0: `--tasks 0 1` (MC/Acrobot), `--tasks 1 2`
+   (Acrobot/FlatMC) — completes the pairwise matrix for the left cluster.
+3. An ablation arm of E1: `value_pi_source="predicted"` (edit the constructor line
+   in the script) — quantifies what the eval-faithful prior buys.
+
+Do NOT run full pilots or baseline re-runs. Commit each result npz + log with a
+descriptive message and push; machine 1 integrates.
+
+## Run matrix v1 (SUPERSEDED — kept for reference)
 
 The runner is `scripts/run_phase.py` (executes a temp copy of figures.ipynb cells
 30–37 with substitutions; the repo notebook is never modified). Gate evaluation:
