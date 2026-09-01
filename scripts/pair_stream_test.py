@@ -23,6 +23,9 @@ PRETRAIN_KW_STD = dict(rollout_steps=2048, mini_epochs=10, mb_size=64)
 CTX_IDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, "novel"]
 PROBE_SEGS, SEG_STEPS = 8, 256
 EVAL_EPISODES = 30
+KL_BETA = 1e-4     # PEARL bottleneck weight, from the beta-window check: codes span
+                   # +-1 (the COIN envelope) with 12x task separation; collapse
+                   # begins at 1e-3, unconstrained wander at 0
 
 
 def pretrain_expert(task):
@@ -109,16 +112,16 @@ def main():
     rl.seed_everything(args.seed)
     proto = f3.make_task_env(MC, None, 200)
     agent = AmortisedCOINPPOAgent(
-        proto, CTX_IDS, z_scale=2.0, prior_sd=0.5, kl_coef=0.0,
+        proto, CTX_IDS, prior_sd=0.5, kl_coef=KL_BETA,
         encoder_lr=3e-4, replay_capacity=512,
         value_coef=1e-3, encoder_reward=True, observe_value=True,
         same_task_rollout=True, **f3.PPO_KWARGS)
     proto.close()
-    coin = RealTimeCOIN(rng=args.seed, sigma_motor_noise=0.05,
-                        prior_mean_retention=0.9995,
-                        state_dim=2,
-                        process_noise_covariance=np.diag([0.0089 ** 2, 0.01 ** 2]),
-                        max_contexts=10)
+    # COIN at its published priors: the PEARL bottleneck holds z in the model's
+    # native envelope (prior_sd 0.5 -> codes ~ +-1 at 2 sigma), so no retention or
+    # process-noise surgery is needed; motor noise is the sensorimotor default pair.
+    coin = RealTimeCOIN(rng=args.seed, sigma_motor_noise=0.0182,
+                        state_dim=2, max_contexts=10)
 
     probes = {t: collect_probe(agent, experts[t][2], t) for t in (MC, FLAT)}
 

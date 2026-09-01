@@ -2603,9 +2603,13 @@ class ContingencyEncoder(nn.Module):
 
     A shared MLP maps every transition ``(s, a, s')`` to its own Gaussian factor; the
     posterior is their product, held in natural parameters so every *prefix* posterior is a
-    running sum -- one ``cumsum`` per segment. Means are ``z_scale * tanh(.)``, so the sample
-    cannot leave COIN's dynamic range. ``prior_sd`` is both the ``k = 0`` posterior and the
-    KL reference.
+    running sum -- one ``cumsum`` per segment. The mean is UNBOUNDED, as in PEARL: what
+    contains the latent is the information bottleneck ``kl_coef * KL(q || N(0,
+    prior_sd^2))``, not a squashing nonlinearity (a tanh bound was tried and created a
+    saturation pathology: codes reaching the bound lose all gradient and freeze there).
+    ``prior_sd`` is the ``k = 0`` posterior, the KL reference, and the statement of
+    COIN's operating envelope -- with the model at its published defaults, codes within
+    ``~2 * prior_sd`` of zero sit in the regime the sensorimotor figures validated.
 
     **Reward is absent from the features by default.** The contingency is a property of
     the DYNAMICS, and reward is the PPO learning signal: feeding it here would let the
@@ -2620,20 +2624,19 @@ class ContingencyEncoder(nn.Module):
     """
 
     def __init__(self, obs_dim: int, act_dim: int, action_continuous: bool, hidden: int = 64,
-                 z_scale: float = 0.15, prior_sd: float = 1.0, sigma_min: float = 0.05,
+                 prior_sd: float = 0.5, sigma_min: float = 0.05,
                  sigma_max: float = 20.0, use_reward: bool = False):
         super().__init__()
         self.obs_dim, self.act_dim = int(obs_dim), int(act_dim)
         self.action_continuous = bool(action_continuous)
         self.use_reward = bool(use_reward)
-        self.z_scale, self.prior_sd = float(z_scale), float(prior_sd)
+        self.prior_sd = float(prior_sd)
         self.log_sigma_min, self.log_sigma_max = float(np.log(sigma_min)), float(np.log(sigma_max))
         self.in_dim = 2 * self.obs_dim + self.act_dim + (1 if self.use_reward else 0)
         self.net = _MLP(self.in_dim, 2, hidden)
 
         # A zero final layer makes every mu_t exactly zero at initialisation, so an untrained
-        # encoder emits a constant z and buys COIN no spurious contexts. The dynamics
-        # gradient survives it, because tanh'(0) = 1.
+        # encoder emits a constant z and buys COIN no spurious contexts.
         last = self.net.net[-1]
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
@@ -2663,7 +2666,7 @@ class ContingencyEncoder(nn.Module):
         """Per-transition Gaussian factors ``mu[T]``, ``sigma[T]``."""
         out = self.net(feats)
         log_sigma = out[..., 1].clamp(self.log_sigma_min, self.log_sigma_max)
-        return self.z_scale * torch.tanh(out[..., 0]), torch.exp(log_sigma)
+        return out[..., 0], torch.exp(log_sigma)
 
     def prefix_posterior(self, feats: torch.Tensor, seg_len: int):
         """
@@ -2786,14 +2789,17 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
 
     Args:
         encoder_hidden (int): Hidden width of both the encoder and the decoder MLP.
-        z_scale (float): Bound on ``|mu_t|``, i.e. COIN's dynamic range for the latent.
-        prior_sd (float): Prior sd, used both as the empty-prefix posterior and as the KL
-            reference.
+        prior_sd (float): Prior sd -- the empty-prefix posterior, the KL reference, and
+            the latent's soft scale: with the PEARL bottleneck this is what states
+            COIN's operating envelope (codes live within ``~2 * prior_sd`` of zero).
         avoid_novel (bool): Drop the novel column from the acting weights whenever the known
             contexts carry mass; see :meth:`_policy_weights`.
-        kl_coef (float): Weight of the KL term in the encoder objective. Keep it above zero:
-            :meth:`train_step` hands the posterior sd to COIN as sensory noise, and an
-            unpenalised sd is not calibrated.
+        kl_coef (float): The PEARL information-bottleneck weight (beta):
+            ``kl_coef * KL(q(z|h) || N(0, prior_sd^2))``. This is the latent's ONLY
+            containment -- the mean is unbounded -- so it must sit in the window between
+            posterior collapse (too large: the prior wins and z goes uninformative) and
+            unconstrained wander (zero). It also calibrates the posterior sd that
+            :meth:`train_step` hands COIN as sensory noise.
         replay_capacity (int): Size of the encoder's :class:`SegmentReplayBuffer`, in
             segments. The pool is a reservoir, so it stays a uniform sample of the whole
             stream rather than a window on the newest block.
@@ -2864,8 +2870,8 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
 
     def __init__(self, env: gym.Env, ctx_ids: dict, encoder_hidden: int = 64,
                  encoder_lr: float = 3e-4, enc_grad_clip: Optional[float] = 1.0,
-                 z_scale: float = 0.15, prior_sd: float = 1.0, avoid_novel: bool = True,
-                 kl_coef: float = 1e-3, replay_capacity: int = 128,
+                 prior_sd: float = 0.5, avoid_novel: bool = True,
+                 kl_coef: float = 1e-4, replay_capacity: int = 128,
                  same_task_rollout: bool = False,
                  decoder_lr_ratio: float = 1.0,
                  value_coef: float = 0.0, encoder_reward: bool = False,
@@ -2874,7 +2880,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                  value_process_noise: float = 0.01,
                  **kwargs):
         super().__init__(env, ctx_ids, **kwargs)
-        self.z_scale, self.prior_sd = float(z_scale), float(prior_sd)
+        self.prior_sd = float(prior_sd)
         self.avoid_novel, self.kl_coef = bool(avoid_novel), float(kl_coef)
         self.enc_grad_clip = enc_grad_clip
         self.value_coef = float(value_coef)
@@ -2887,7 +2893,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         self._group_counter = 0
         self.encoder = ContingencyEncoder(
             self.obs_dim, self.act_dim, self.action_continuous, hidden=encoder_hidden,
-            z_scale=z_scale, prior_sd=prior_sd,
+            prior_sd=prior_sd,
             use_reward=self.encoder_reward).to(self.device)
         sa_dim = self.obs_dim + self.act_dim
         # With encoder_reward the decoder PREDICTS the reward as one extra output --

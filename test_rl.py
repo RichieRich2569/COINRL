@@ -129,13 +129,13 @@ def spy_on_advantages(agent, record):
 def agent():
     env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
     torch.manual_seed(0)
-    return AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3, prior_sd=0.3,
+    return AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
                                  kl_coef=0.03)
 
 
 def test_prefix_posterior_matches_naive_product():
     """The cumsum form equals an explicit product of Gaussian factors, per segment."""
-    enc = make_encoder(prior_sd=0.7, z_scale=0.5)
+    enc = make_encoder(prior_sd=0.7, )
     seg_len, n_seg = 5, 2
     feats = torch.randn(n_seg * seg_len, enc.in_dim)
 
@@ -428,7 +428,7 @@ def test_train_step_fills_replay(agent):
 def make_dec_agent(**kw):
     env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
     torch.manual_seed(0)
-    return AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
+    return AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, 
                                  prior_sd=0.3, kl_coef=0.0, encoder_lr=3e-4, **kw)
 
 
@@ -486,7 +486,7 @@ def test_value_loss_gradient_reaches_encoder_only_when_heads_disagree():
 
     def grad_norm(perturb):
         torch.manual_seed(0)
-        a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
+        a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, 
                                   prior_sd=0.3, kl_coef=0.0, value_coef=1.0)
         loss = _value_loss_setup(a, perturb_head=perturb)
         assert loss is not None and torch.isfinite(loss)
@@ -508,7 +508,7 @@ def test_encoder_reward_layout_and_prediction():
     reward head trained by _dyn_loss, and the reward never reaches the decoder input."""
     env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
     torch.manual_seed(0)
-    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, 
                               prior_sd=0.3, kl_coef=0.0, encoder_reward=True)
     assert a.encoder.in_dim == 2 * a.obs_dim + a.act_dim + 1
     L = 8
@@ -614,7 +614,7 @@ def test_observe_value_feeds_coin_2d_vectors():
     none ended), and the self-identifying eval runs on the z marginal."""
     env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
     torch.manual_seed(0)
-    agent = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
+    agent = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, 
                                   prior_sd=0.3, kl_coef=0.0, observe_value=True)
     coin = make_coin_2d()
     seen_y, seen_cov = [], []
@@ -651,7 +651,7 @@ def test_observe_value_uses_raw_returns_on_shaped_envs():
     env = MountainCarXEnv(amplitude=1.0, shaping_coef=60000.0,
                           max_episode_steps=40)
     torch.manual_seed(0)
-    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, 
                               prior_sd=0.3, kl_coef=0.0, observe_value=True)
 
     seen = {}
@@ -1047,7 +1047,7 @@ def test_seed_everything_reproduces_a_rep():
         seed_envs(envs, seed)
         agent = AmortisedCOINPPOAgent(CustomCartPoleEnv(force_mag=10.0,
                                                         max_episode_steps=20),
-                                      CTX_IDS, encoder_hidden=8, z_scale=0.3,
+                                      CTX_IDS, encoder_hidden=8, 
                                       prior_sd=0.3, kl_coef=0.03, replay_capacity=2)
         out = agent.train_step(envs, RealTimeCOIN(rng=seed), seg_steps=16, mini_epochs=1,
                                mb_size=16, enc_steps=1, mb_segments=1)
@@ -1165,3 +1165,4 @@ def test_transition_matrix_metrics():
                        [[0.5 / 0.75, 0.25 / 0.75], [0.7 / 0.8, 0.1 / 0.8]])
     with pytest.raises(ValueError):
         curriculum.reorder_transition_matrix(wide, np.array([0, -1]))
+
