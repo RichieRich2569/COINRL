@@ -2956,6 +2956,8 @@ class SegmentReplayBuffer:
     def sample(self, n_segments: int):
         """``(feats, anchors)``: ``[n * L, in_dim]`` segment-major features sampled
         uniformly without replacement, and the matching ``[n]`` float32 anchors."""
+        if not self.buffer:
+            raise RuntimeError("sample from an empty SegmentReplayBuffer")
         idx = torch.randperm(len(self.buffer))[:int(n_segments)]
         feats = torch.cat([self.buffer[int(i)] for i in idx])
         anchors = torch.tensor([self.anchors[int(i)] for i in idx], dtype=torch.float32)
