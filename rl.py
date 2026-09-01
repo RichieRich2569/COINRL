@@ -4189,6 +4189,12 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             obs_t, ep_ret = self._start_segment(env, carry_state)
             obs, act, rew, nxt, frew = [], [], [], [], []
             ep_returns, done, trunc = [], False, False
+            # Raw twin of ep_ret for the value OBSERVATION (observe_value): the same
+            # raw-channel principle as the encoder features -- a task's observed value
+            # must not depend on whether its training env is shaped. (A carried
+            # episode's pre-boundary raw sum is unknown; carry_state is False in the
+            # Figure-3 protocol, where this is exact.)
+            ep_ret_raw, ep_raw_returns = 0.0, []
 
             for _ in range(L):
                 with torch.no_grad():
@@ -4228,10 +4234,13 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                     pi_agent, z_t, sd_t, ctx_mu, ctx_var, floor2))
 
                 ep_ret += reward
+                ep_ret_raw += frew[-1]
                 if done or trunc:
                     next_obs, _ = env.reset()
                     ep_returns.append(ep_ret)
+                    ep_raw_returns.append(ep_ret_raw)
                     ep_ret = 0.0
+                    ep_ret_raw = 0.0
                 obs_t = self._flatten_obs(next_obs)
 
             seg_w_final.append(w_t)
@@ -4264,14 +4273,17 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             # reads it fresh at every use and adds sigma_motor_noise (the floor) in quadrature.
             z_obs, sd_obs = self._obs_transform(float(mean_s[0, -1]), float(sd_s[0, -1]))
             if self.observe_value:
-                # Second observation dim: mean return of the episodes that ENDED in
-                # this segment (nan when none did -- the MD pipeline masks that dim),
-                # with its standard error; floors enter in quadrature because the
-                # explicit R override bypasses the isotropic sigma defaults.
-                n_eps = len(ep_returns)
-                r_bar = (float(np.mean(ep_returns)) / self.value_obs_scale
+                # Second observation dim: mean RAW return of the episodes that ENDED
+                # in this segment (nan when none did -- the MD pipeline masks that
+                # dim), with its standard error; floors enter in quadrature because
+                # the explicit R override bypasses the isotropic sigma defaults.
+                # Raw, not shaped: MountainCar's shaping inflates episodic returns by
+                # ~ +Phi(end)-Phi(start), which would shift its value coordinate into
+                # the cartpoles' early-training range and differ from any raw stream.
+                n_eps = len(ep_raw_returns)
+                r_bar = (float(np.mean(ep_raw_returns)) / self.value_obs_scale
                          if n_eps else float("nan"))
-                sd_r = (float(np.std(ep_returns)) / np.sqrt(n_eps)
+                sd_r = (float(np.std(ep_raw_returns)) / np.sqrt(n_eps)
                         / self.value_obs_scale if n_eps else 0.0)
                 floor = float(getattr(coin, "sigma_motor_noise", 0.0))
                 coin.observation_noise_covariance = np.diag(

@@ -1236,6 +1236,57 @@ def test_observe_value_feeds_coin_2d_vectors():
     env.close()
 
 
+def test_observe_value_uses_raw_returns_on_shaped_envs():
+    """The value observation must ride the RAW reward channel: on a shaped
+    MountainCar the observed r_bar equals the raw episodic mean, not the shaped one."""
+    from environments import MountainCarXEnv
+
+    env = MountainCarXEnv(amplitude=1.0, shaping_coef=60000.0,
+                          max_episode_steps=40)
+    torch.manual_seed(0)
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, z_scale=0.3,
+                              prior_sd=0.3, kl_coef=0.0, observe_value=True)
+
+    seen = {}
+
+    class SpyCoin:
+        sigma_motor_noise = 0.01
+        state_dim = 2
+
+        def observe_q(self, q):            pass
+        def observe_y(self, y):            seen["y"] = np.array(y, dtype=float)
+        def context_alignment(self):
+            return {"K": 0, "global_contexts": {"state_mean": np.zeros((0, 2)),
+                                                "bias_mean": np.zeros((0, 2)),
+                                                "state_cov": np.zeros((0, 2, 2))}}
+        def responsibilities_vector(self):
+            v = np.zeros(11); v[0] = 1.0; return v
+        def stationary_context_probabilities(self):
+            return np.full(11, 1 / 11)
+        prior_mean_retention = 0.9995
+        prior_mean_drift = 0.0
+        sigma_process_noise = 0.0089
+        process_noise_covariance = np.diag([0.0089 ** 2, 0.01 ** 2])
+
+    import rl as rl_mod
+    orig = rl_mod.coin_predicted_pi
+    rl_mod.coin_predicted_pi = lambda coin, cue=None: (np.full(11, np.nan), 0)
+    try:
+        a.train_step([env], SpyCoin(), seg_steps=64, mini_epochs=1, mb_size=32,
+                     enc_steps=1, mb_segments=1, carry_state=False)
+    finally:
+        rl_mod.coin_predicted_pi = orig
+    env.close()
+
+    assert "y" in seen and seen["y"].shape == (2,)
+    r_obs = seen["y"][1]
+    if np.isfinite(r_obs):
+        # A 40-step shaped MC episode: raw return is about -40/200; the shaped one
+        # is displaced by the potential difference. The observation must be raw.
+        assert -0.5 <= r_obs <= 0.0
+        assert abs(r_obs - (-40.0 / 200.0)) < 0.1
+
+
 #----- EMA-teacher anchor -----
 
 def make_ema_agent(tau=0.9, anchor_coef=1.0):
