@@ -17,3 +17,10 @@ fig3_amortised_plan.md
 
 # Local backups
 *.bak
+
+# Agent worktrees (full checkouts living inside the repo)
+.claude/worktrees/
+
+# Ad-hoc probe outputs (the committed checkpoints are models/fig{N}_*.npz)
+models/*.log
+models/*.err

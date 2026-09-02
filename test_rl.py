@@ -1,4 +1,4 @@
-﻿"""
+"""
 test_rl.py
 
 Basic pytest coverage for the dynamics-based amortised COIN-PPO block of :mod:`rl`:
@@ -291,7 +291,8 @@ def test_train_step_smoke(agent):
         assert set(out) == {"z", "z_sd", "K", "pi", "rho", "w_mean", "sharpen_step",
                             "mean_episode_return", "mean_reward_per_step", "value_loss",
                             "policy_loss", "dyn_loss", "encoder_kl", "enc_grad_norm",
-                            "enc_value_loss"}
+                            "enc_value_loss", "ewc_loss", "anchor_loss",
+                            "ewc_head_loss"}
         for key in ("z", "z_sd", "K", "mean_episode_return", "sharpen_step"):
             assert out[key].shape == (S,)
         for key in ("pi", "rho", "w_mean"):
@@ -314,9 +315,14 @@ def test_pretrain_encoder_and_frozen_train_step(agent):
 
     history = agent.pretrain_encoder(envs, seg_steps=32, n_iters=2, enc_steps=2, mb_segments=2)
 
-    assert set(history) == {"dyn_loss", "encoder_kl", "enc_grad_norm"}
-    for values in history.values():
-        assert values.shape == (2,) and np.isfinite(values).all()
+    assert set(history) == {"dyn_loss", "encoder_kl", "enc_grad_norm", "ewc_loss", "anchor_loss"}
+    # ewc_loss stays nan with nothing consolidated -- the replay-only baseline.
+    assert np.isnan(history["ewc_loss"]).all()
+    assert np.isnan(history["anchor_loss"]).all()
+    for key, values in history.items():
+        assert values.shape == (2,)
+        if key not in ("ewc_loss", "anchor_loss"):
+            assert np.isfinite(values).all()
     assert any(not torch.equal(b, p)
                for b, p in zip(before, agent.encoder.parameters()))
     # The pretrain segments land in the same pool the RL phase replays from.
@@ -501,6 +507,339 @@ def test_value_loss_gradient_reaches_encoder_only_when_heads_disagree():
 
 def test_value_coef_is_off_by_default(agent):
     assert agent.value_coef == 0.0
+
+
+def test_anchor_holds_inactive_contexts_and_skips_the_active_one():
+    """The anchor pulls replayed segments of OTHER contexts toward their stored
+    centres and leaves the context currently being learned alone -- anchoring the
+    active one would close a loop with COIN's belief whose fixed point is any current
+    agreement, including a wrong one."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    torch.manual_seed(0)
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                              kl_coef=0.0, anchor_coef=1.0)
+    for p in a.encoder.net.net[-1].parameters():
+        nn.init.normal_(p, std=0.5)
+    L = 8
+    a.ctx_centre = {0: -1.5, 1: 2.0}
+    torch.manual_seed(1)
+    feats = torch.randn(3 * L, a.encoder.in_dim)
+    ctx = torch.tensor([0, 1, 2])
+
+    a._active_ctx = 2                       # context 2 has no snapshot anyway
+    both = a._encoder_anchor_loss(feats, ctx, L)
+    assert both is not None and torch.isfinite(both)
+    both.backward()
+    assert sum(p.grad.abs().sum() for p in a.encoder.parameters()
+               if p.grad is not None) > 1e-6
+
+    a._active_ctx = 0                       # now 0 is excluded
+    only1 = a._encoder_anchor_loss(feats, ctx, L)
+    with torch.no_grad():
+        mean, _ = a.encoder.prefix_posterior(feats, L)
+        expect = float((mean[1, -1] - 2.0) ** 2)
+    assert float(only1) == pytest.approx(expect, rel=1e-5)
+    assert float(only1) != pytest.approx(float(both))
+
+    a.ctx_centre = {}                       # nothing to anchor to -> no term at all
+    assert a._encoder_anchor_loss(feats, ctx, L) is None
+
+
+def test_anchor_snapshot_requires_confident_responsibility():
+    """A centre is stored only while its context was confidently responsible, so a
+    context whose centre a capturing task has dragged away is never used as a target."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    torch.manual_seed(0)
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                              anchor_coef=1.0, anchor_rho_min=0.9)
+
+    class FakeCoin:
+        def context_alignment(self):
+            return {"global_contexts": {"state_mean": [[0.7], [0.1]],
+                                        "bias_mean": [[0.0], [0.0]]}}
+
+    coin = FakeCoin()
+    # Confident -> snapshot taken, and it is the z coordinate of the centre.
+    assert a._note_context(coin, np.array([0.95, 0.05, np.nan]), 2) == 0
+    assert a.ctx_centre == {0: pytest.approx(0.7)}
+    assert a._active_ctx == 0
+    # Ambiguous -> the context is still the active one, but NO snapshot is taken.
+    assert a._note_context(coin, np.array([0.45, 0.55, np.nan]), 2) == 1
+    assert 1 not in a.ctx_centre
+    assert a._active_ctx == 1
+    # Nothing known at all.
+    assert a._note_context(coin, np.array([np.nan, np.nan, 1.0]), 0) == -1
+
+
+def test_train_step_labels_replay_segments_with_their_context(agent):
+    """Every stored segment carries COIN's verdict, and the label is recorded after
+    observe_y (so it is the verdict on that segment, not the prior belief)."""
+    agent.anchor_coef = 1.0
+    envs, coin = make_envs(), RealTimeCOIN(rng=0)
+    agent.train_step(envs, coin, seg_steps=32, mini_epochs=1, mb_size=16,
+                     enc_steps=1, mb_segments=1)
+    assert len(agent.replay.ctx_ids) == len(agent.replay)
+    assert all(c >= -1 for c in agent.replay.ctx_ids)
+    feats, ctx = agent.replay.sample(len(agent.replay), with_ctx=True)
+    assert ctx.shape == (len(agent.replay),)
+    assert feats.shape[0] == len(agent.replay) * 32
+
+
+def test_anchor_is_off_by_default(agent):
+    assert agent.anchor_coef == 0.0 and agent.ctx_centre == {}
+    agent.replay.push(torch.randn(8, agent.encoder.in_dim))
+    assert agent.replay.sample(1).dim() == 2          # plain tensor unless asked
+    assert len(agent.replay.sample(1, with_ctx=True)) == 2
+
+
+def test_act_gate_routes_hard_so_one_head_acts_alone():
+    """OWL's acting rule. With a soft mixture only the weighted SUM of the heads'
+    logits is constrained, so heads sharing responsibility never become individually
+    competent -- which is what evaluation, routing to (nearly) one head, then reads."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    torch.manual_seed(0)
+    soft = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3)
+    torch.manual_seed(0)
+    hard = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                                 act_gate="argmax")
+    assert soft.act_gate == "off"                      # default unchanged
+
+    pi = np.array([0.6, 0.3, 0.1])
+    w_soft = soft._policy_weights(pi).numpy()
+    w_hard = hard._policy_weights(pi).numpy()
+    assert np.allclose(w_soft, [2.0 / 3.0, 1.0 / 3.0, 0.0])   # renormalised, novel dropped
+    assert np.allclose(w_hard, [1.0, 0.0, 0.0])               # one-hot on the argmax
+    assert w_hard.sum() == pytest.approx(1.0)
+
+    # NaN padding (uninstantiated slots) must not win the argmax.
+    pi_nan = np.array([0.2, np.nan, 0.0])
+    assert np.allclose(hard._policy_weights(pi_nan).numpy(), [1.0, 0.0, 0.0])
+
+    # Trial 0: everything on novel, nothing known -- the one-hot must land there
+    # rather than on an empty slot.
+    pi0 = np.array([0.0, 0.0, 1.0])
+    assert np.allclose(hard._policy_weights(pi0).numpy(), [0.0, 0.0, 1.0])
+
+
+def test_learn_gate_preserves_the_forward_pass_but_restricts_gradient():
+    """OWL's stability without breaking PPO: the mixture's OUTPUT is untouched (so the
+    importance ratio still compares the right two policies) while heads below the gate
+    receive no gradient at all."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+
+    def build(mode):
+        torch.manual_seed(0)
+        a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                                  learn_gate=mode, learn_gate_thresh=0.3)
+        a.ensure_contexts(2)
+        with torch.no_grad():                 # differentiate the heads
+            for cid in a.context_keys[:2]:
+                for p in a.nets[cid][1].parameters():
+                    p.add_(torch.randn_like(p) * 0.1)
+        return a
+
+    obs = torch.randn(6, 4)
+    w = torch.zeros(6, 3)
+    w[:, 0], w[:, 1] = 0.9, 0.1            # head 1 is below the 0.3 gate
+
+    base = build("off")
+    ref = base._mixed_logits(obs, w)
+    for mode in ("thresh", "argmax"):
+        a = build(mode)
+        out = a._mixed_logits(obs, w)
+        assert torch.allclose(out, ref, atol=1e-6)      # behaviour identical
+        out.sum().backward()
+        g0 = sum(float(p.grad.abs().sum()) for p in a.nets[a.context_keys[0]][1].parameters()
+                 if p.grad is not None)
+        g1 = sum(float(p.grad.abs().sum()) for p in a.nets[a.context_keys[1]][1].parameters()
+                 if p.grad is not None)
+        assert g0 > 1e-8 and g1 == 0.0                  # only the routed head learns
+
+    # Off: both heads get gradient, which is the leakage OWL avoids.
+    a = build("off")
+    a._mixed_logits(obs, w).sum().backward()
+    assert all(sum(float(p.grad.abs().sum())
+                   for p in a.nets[cid][1].parameters() if p.grad is not None) > 1e-8
+               for cid in a.context_keys[:2])
+
+
+def test_learn_gate_also_protects_value_heads(agent):
+    """The same gate applies to the critic mixture."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    torch.manual_seed(0)
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                              learn_gate="argmax")
+    a.ensure_contexts(2)
+    obs = torch.randn(5, 4)
+    w = torch.zeros(5, 3)
+    w[:, 0], w[:, 1] = 0.8, 0.2
+    a._mixed_value(obs, w).sum().backward()
+    g1 = sum(float(p.grad.abs().sum()) for p in a.nets[a.context_keys[1]][2].parameters()
+             if p.grad is not None)
+    assert g1 == 0.0
+    assert agent.learn_gate == "off"          # default is the old behaviour
+
+
+def test_head_ewc_protects_consolidated_heads_only():
+    """Kirkpatrick's penalty on the HEADS -- where the Figure-3 EWC baseline applies
+    it. Zero at the snapshot, quadratic in distance, and a head born AFTER the
+    snapshot is not constrained (there is nothing to preserve about it yet)."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    torch.manual_seed(0)
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                              kl_coef=0.03, ewc_head_coef=1.0)
+    L = 8
+    for _ in range(4):
+        a.replay.push(torch.randn(L, a.encoder.in_dim))
+    assert a._ewc_head_penalty() is None            # nothing consolidated yet
+
+    a.ensure_contexts(1)                            # only head 0 exists
+    info = a.consolidate_heads(L, n_batches=4, mb_segments=2)
+    assert info["n_head_tasks"] == 1.0 and info["head_fisher_trace"] > 0.0
+    assert float(a._ewc_head_penalty()) == pytest.approx(0.0, abs=1e-12)
+
+    cid0 = a.context_keys[0]
+    with torch.no_grad():
+        for p in a.nets[cid0][1].parameters():
+            p.add_(0.01)
+    small = float(a._ewc_head_penalty())
+    with torch.no_grad():
+        for p in a.nets[cid0][1].parameters():
+            p.add_(0.01)
+    big = float(a._ewc_head_penalty())
+    assert small > 0.0 and big == pytest.approx(4.0 * small, rel=1e-4)
+
+    # A head born later is absent from the snapshot and must be skipped, not crash.
+    a.ensure_contexts(2)
+    assert torch.isfinite(a._ewc_head_penalty())
+    cid1 = a.context_keys[1]
+    before = float(a._ewc_head_penalty())
+    with torch.no_grad():
+        for p in a.nets[cid1][1].parameters():
+            p.add_(5.0)
+    assert float(a._ewc_head_penalty()) == pytest.approx(before)
+
+
+def test_head_ewc_reaches_the_heads_in_a_train_step():
+    """End to end: the penalty is applied where the heads are optimised (the PPO
+    update), and is reported."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    torch.manual_seed(0)
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                              kl_coef=0.03, ewc_head_coef=1e3)
+    envs, coin = make_envs(), RealTimeCOIN(rng=0)
+    out = a.train_step(envs, coin, seg_steps=32, mini_epochs=1, mb_size=16,
+                       enc_steps=1, mb_segments=1)
+    assert np.isnan(out["ewc_head_loss"])           # nothing consolidated yet
+    a.consolidate_heads(32, n_batches=4, mb_segments=1)
+    out = a.train_step(envs, coin, seg_steps=32, mini_epochs=1, mb_size=16,
+                       enc_steps=1, mb_segments=1)
+    assert np.isfinite(out["ewc_head_loss"])
+
+
+def test_ewc_is_off_by_default(agent):
+    """Nothing consolidated -> no penalty, so the agent is the replay-only baseline."""
+    assert agent.ewc_coef == 0.0 and agent.ewc_tasks == []
+    assert agent._ewc_penalty() is None
+
+
+def test_ewc_penalty_is_zero_at_the_snapshot_and_grows_with_distance():
+    """The penalty is a Fisher-weighted quadratic about the consolidated weights."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    torch.manual_seed(0)
+    a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                              kl_coef=0.03, ewc_coef=1.0)
+    L = 8
+    for _ in range(4):
+        a.replay.push(torch.randn(L, a.encoder.in_dim))
+    info = a.consolidate_encoder(L, n_batches=4, mb_segments=2)
+    assert info["n_tasks"] == 1.0 and info["fisher_trace"] > 0.0
+
+    # At the snapshot the encoder has not moved, so the penalty is exactly zero.
+    assert float(a._ewc_penalty()) == pytest.approx(0.0, abs=1e-12)
+
+    # Move the weights: the penalty grows, and quadratically.
+    star = {n: p.detach().clone() for n, p in a.encoder.named_parameters()}
+    with torch.no_grad():
+        for p in a.encoder.parameters():
+            p.add_(0.01)
+    small = float(a._ewc_penalty())
+    with torch.no_grad():
+        for n, p in a.encoder.named_parameters():
+            p.copy_(star[n] + 0.02)
+    big = float(a._ewc_penalty())
+    assert small > 0.0 and big == pytest.approx(4.0 * small, rel=1e-4)
+
+    # A second consolidation ADDS a term rather than replacing it.
+    a.consolidate_encoder(L, n_batches=2, mb_segments=2)
+    assert len(a.ewc_tasks) == 2
+
+
+def test_ewc_protects_the_decoder_by_default():
+    """The decoder carries the task-specific half of the dynamics model, so it is
+    inside the penalty by default; ewc_protect_decoder=False isolates the encoder,
+    which is the configuration the probe measured as useless on its own."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    L = 8
+
+    def grads(protect):
+        torch.manual_seed(0)
+        a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                                  kl_coef=0.03, ewc_coef=1.0,
+                                  ewc_protect_decoder=protect)
+        for _ in range(4):
+            a.replay.push(torch.randn(L, a.encoder.in_dim))
+        a.consolidate_encoder(L, n_batches=4, mb_segments=2)
+        with torch.no_grad():
+            for p in list(a.encoder.parameters()) + list(a.decoder.parameters()):
+                p.add_(0.05)
+        a.enc_optim.zero_grad()
+        a._ewc_penalty().backward()
+        enc = sum(float(p.grad.abs().sum()) for p in a.encoder.parameters()
+                  if p.grad is not None)
+        dec = sum(float(p.grad.abs().sum()) for p in a.decoder.parameters()
+                  if p.grad is not None)
+        return enc, dec
+
+    enc_on, dec_on = grads(True)
+    enc_off, dec_off = grads(False)
+    assert enc_on > 1e-8 and dec_on > 1e-8      # both protected by default
+    assert enc_off > 1e-8 and dec_off == 0.0    # encoder-only when asked
+
+
+def test_ewc_slows_parameter_movement_in_a_real_update():
+    """End to end: with the same data and seed, a consolidated model under a strong
+    EWC penalty moves less than an unconstrained one. The coefficient has to be large
+    -- the Fisher of this objective is ~1e-5, so the penalty only competes with L_dyn
+    at coefficients far above the usual EWC range."""
+    env = CustomCartPoleEnv(force_mag=10.0, max_episode_steps=50)
+    L = 8
+
+    def moved(coef):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        a = AmortisedCOINPPOAgent(env, CTX_IDS, encoder_hidden=8, prior_sd=0.3,
+                                  kl_coef=0.03, ewc_coef=coef)
+        torch.manual_seed(1)
+        for _ in range(4):
+            a.replay.push(torch.randn(L, a.encoder.in_dim))
+        a._update_encoder(L, 5, 2)
+        if coef > 0.0:
+            a.consolidate_encoder(L, n_batches=8, mb_segments=2)
+        watched = list(a.encoder.parameters()) + list(a.decoder.parameters())
+        before = [p.detach().clone() for p in watched]
+        # A different "task": fresh data, old data discarded.
+        a.replay.clear()
+        torch.manual_seed(2)
+        for _ in range(4):
+            a.replay.push(torch.randn(L, a.encoder.in_dim))
+        np.random.seed(0)
+        torch.manual_seed(3)
+        a._update_encoder(L, 20, 2)
+        return sum(float((p - b).abs().sum()) for b, p in zip(before, watched))
+
+    free, held = moved(0.0), moved(1e8)
+    assert held < 0.5 * free
 
 
 def test_encoder_reward_layout_and_prediction():

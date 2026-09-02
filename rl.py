@@ -2161,16 +2161,53 @@ class COINPPOAgent(PPOAgent):
             )
 
         mixed_logits = torch.zeros(B, self.act_dim, device=device)
+        keep = self._learn_gate_mask(ctx_probs)
 
         for j, cid in enumerate(self.context_keys):
             if self.context_init.get(cid, 0) == 0:
                 continue
             _, policy, _, _ = self.nets[cid]
             logits_c = policy(obs_t)                     # [B, act_dim]
+            if keep is not None:
+                logits_c = self._gate(logits_c, keep[:, j].view(B, 1))
             w_c = ctx_probs[:, j].view(B, 1)            # [B, 1]
             mixed_logits = mixed_logits + w_c * logits_c
 
         return mixed_logits
+
+    # ------------------------------------------------------------------
+    # OWL-style learning gate
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _gate(x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+        """``x`` where ``keep``, a detached copy elsewhere.
+
+        The FORWARD value is identical either way -- only the gradient path changes.
+        That matters: PPO's ratio compares the new policy against the behaviour policy
+        that produced ``old_logp``, so changing the mixture's output here would break
+        the importance ratio. Restricting credit assignment does not.
+        """
+        return keep * x + (1.0 - keep) * x.detach()
+
+    def _learn_gate_mask(self, ctx_probs: torch.Tensor) -> Optional[torch.Tensor]:
+        """``[B, N]`` 1/0 mask of which heads may receive gradient this batch.
+
+        OWL's stability comes from updating ONLY the routed head, so the other heads
+        cannot be touched. Ours updates every head in proportion to its acting weight,
+        which is how a head that was never the responsible context still learned a task
+        (measured: two heads reached 150-166 on task B while never dominating). This
+        gates credit assignment without touching behaviour: ``"argmax"`` is OWL's
+        limit, ``"thresh"`` protects only heads below ``learn_gate_thresh``.
+        """
+        mode = getattr(self, "learn_gate", "off")
+        if mode == "off":
+            return None
+        w = ctx_probs.detach()
+        if mode == "argmax":
+            keep = torch.zeros_like(w)
+            keep.scatter_(1, w.argmax(dim=1, keepdim=True), 1.0)
+            return keep
+        return (w >= float(getattr(self, "learn_gate_thresh", 0.1))).to(w.dtype)
 
     # ------------------------------------------------------------------
     # Mixed value (critic)
@@ -2196,12 +2233,15 @@ class COINPPOAgent(PPOAgent):
             )
 
         mixed_value = torch.zeros(B, device=device)
+        keep = self._learn_gate_mask(ctx_probs)
 
         for j, cid in enumerate(self.context_keys):
             if self.context_init.get(cid, 0) == 0:
                 continue
             _, _, value_net, _ = self.nets[cid]
             v_c = value_net(obs_t).squeeze(-1)          # [B]
+            if keep is not None:
+                v_c = self._gate(v_c, keep[:, j])
             w_c = ctx_probs[:, j]                       # [B]
             mixed_value = mixed_value + w_c * v_c
 
@@ -2716,6 +2756,7 @@ class SegmentReplayBuffer:
         self.capacity = int(capacity)
         self.buffer: List[torch.Tensor] = []
         self.group_ids: List[int] = []   # segments known to share a task; see push()
+        self.ctx_ids: List[int] = []     # context COIN held responsible; -1 if unknown
         self.n_seen = 0                  # segments pushed since the last length change
 
     def __len__(self) -> int:
@@ -2725,13 +2766,19 @@ class SegmentReplayBuffer:
         """Empty the pool and restart the reservoir count."""
         self.buffer.clear()
         self.group_ids.clear()
+        self.ctx_ids.clear()
         self.n_seen = 0
 
-    def push(self, feats: torch.Tensor, group: Optional[int] = None) -> None:
+    def push(self, feats: torch.Tensor, group: Optional[int] = None,
+             ctx: int = -1) -> None:
         """Store one segment's features and its group under Algorithm R.
 
         ``group`` marks segments the CALLER knows came from the same task, without saying
         which task; ``None`` gives the segment a group of its own.
+
+        ``ctx`` is the context COIN held responsible for the segment (``-1`` when
+        unknown), which the centre anchor needs in order to know WHICH centre a
+        replayed segment should be held at.
 
         A change of segment length empties the pool (and restarts the reservoir count):
         :meth:`ContingencyEncoder.prefix_posterior` needs one common length.
@@ -2743,6 +2790,7 @@ class SegmentReplayBuffer:
         if len(self.buffer) < self.capacity:
             self.buffer.append(feats)
             self.group_ids.append(g)
+            self.ctx_ids.append(int(ctx))
         else:
             # j uniform on [0, n_seen]; the reservoir keeps the new segment with
             # probability capacity / (n_seen + 1), which is Algorithm R's invariant.
@@ -2750,15 +2798,20 @@ class SegmentReplayBuffer:
             if j < self.capacity:
                 self.buffer[j] = feats
                 self.group_ids[j] = g
+                self.ctx_ids[j] = int(ctx)
         self.n_seen += 1
 
-    def sample(self, n_segments: int):
+    def sample(self, n_segments: int, with_ctx: bool = False):
         """``[n * L, in_dim]`` segment-major features sampled uniformly without
-        replacement."""
+        replacement. ``with_ctx`` also returns the ``[n]`` per-SEGMENT context ids."""
         if not self.buffer:
             raise RuntimeError("sample from an empty SegmentReplayBuffer")
         idx = torch.randperm(len(self.buffer))[:int(n_segments)]
-        return torch.cat([self.buffer[int(i)] for i in idx])
+        feats = torch.cat([self.buffer[int(i)] for i in idx])
+        if not with_ctx:
+            return feats
+        ctx = torch.tensor([self.ctx_ids[int(i)] for i in idx], dtype=torch.long)
+        return feats, ctx
 
 
 class AmortisedCOINPPOAgent(COINPPOAgent):
@@ -2878,8 +2931,42 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                  observe_value: bool = False, value_obs_scale: float = 200.0,
                  value_obs_noise_floor: float = 0.05,
                  value_process_noise: float = 0.01,
+                 ewc_coef: float = 0.0, ewc_protect_decoder: bool = True,
+                 ewc_head_coef: float = 0.0,
+                 learn_gate: str = "off", learn_gate_thresh: float = 0.1,
+                 act_gate: str = "off",
+                 anchor_coef: float = 0.0, anchor_rho_min: float = 0.8,
                  **kwargs):
         super().__init__(env, ctx_ids, **kwargs)
+        if learn_gate not in ("off", "thresh", "argmax"):
+            raise ValueError(f"learn_gate must be off/thresh/argmax, got {learn_gate!r}")
+        if act_gate not in ("off", "argmax"):
+            raise ValueError(f"act_gate must be off/argmax, got {act_gate!r}")
+        self.learn_gate = str(learn_gate)
+        self.learn_gate_thresh = float(learn_gate_thresh)
+        self.act_gate = str(act_gate)
+        self.anchor_coef = float(anchor_coef)
+        self.anchor_rho_min = float(anchor_rho_min)
+        # Snapshot of each context's z-centre, taken only while that context was
+        # CONFIDENTLY responsible. Deliberately not the LIVE centre: if a context is
+        # later captured by another task its live centre migrates, and anchoring to
+        # that would drag the original task's code along behind the error.
+        self.ctx_centre: Dict[int, float] = {}
+        self._active_ctx: int = -1
+        self.ewc_coef = float(ewc_coef)
+        self.ewc_protect_decoder = bool(ewc_protect_decoder)
+        # Separate weight: encoder EWC and head EWC target different failures and the
+        # encoder one was measured to hurt on a live stream, so they must be settable
+        # independently.
+        self.ewc_head_coef = float(ewc_head_coef)
+        # (theta*, diagonal Fisher) per consolidated task; empty = plain replay
+        # training, bit-identical to the baseline.
+        self.ewc_tasks: List[Tuple[Dict[str, torch.Tensor],
+                                   Dict[str, torch.Tensor]]] = []
+        # Separate list for the HEADS: they have their own optimisers, so their penalty
+        # is applied in the PPO update rather than the encoder update.
+        self.ewc_head_tasks: List[Tuple[Dict[str, torch.Tensor],
+                                        Dict[str, torch.Tensor]]] = []
         self.prior_sd = float(prior_sd)
         self.avoid_novel, self.kl_coef = bool(avoid_novel), float(kl_coef)
         self.enc_grad_clip = enc_grad_clip
@@ -2947,6 +3034,16 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         w = np.nan_to_num(np.asarray(pi_agent, dtype=np.float64), nan=0.0)
         if self.avoid_novel and w[:-1].sum() > 1e-6:
             w = np.concatenate([w[:-1] / w[:-1].sum(), [0.0]])
+        if getattr(self, "act_gate", "off") == "argmax" and w.sum() > 0.0:
+            # OWL routes HARD: one head acts alone. With a soft mixture only the
+            # weighted SUM of the heads' logits is constrained by the PPO objective,
+            # so heads sharing responsibility become jointly meaningful and
+            # individually meaningless -- measured directly: a block whose mixture
+            # trains to 200 leaves every one of its heads scoring 9 alone, which is
+            # what evaluation (near single-head routing) then reads.
+            hard = np.zeros_like(w)
+            hard[int(np.argmax(w))] = 1.0
+            w = hard
         return torch.as_tensor(w, dtype=torch.float32, device=self.device)
 
     def _logp_entropy(self, obs: torch.Tensor, act: torch.Tensor, w: torch.Tensor):
@@ -3119,9 +3216,12 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         """
         clip = float("inf") if self.enc_grad_clip is None else float(self.enc_grad_clip)
         dyn_val = kl_val = grad_norm = float("nan")
+        ewc_val = float("nan")
 
+        anc_val = float("nan")
         for _ in range(int(enc_steps)):
-            feats = self.replay.sample(mb_segments).to(self.device)
+            feats, ctx = self.replay.sample(mb_segments, with_ctx=True)
+            feats = feats.to(self.device)
             mean, sd = self.encoder.prefix_posterior(feats, seg_len)
             z = (mean[:, :-1] + torch.randn_like(sd[:, :-1]) * sd[:, :-1]).reshape(-1)
 
@@ -3129,13 +3229,212 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             kl = self._kl_to_prior(mean, sd).mean()
             loss = dyn + self.kl_coef * kl
 
+            if self.anchor_coef > 0.0:
+                anc = self._encoder_anchor_loss(feats, ctx, seg_len)
+                if anc is not None:
+                    loss = loss + self.anchor_coef * anc
+                    anc_val = float(anc.item())
+
+            ewc = self._ewc_penalty()
+            if ewc is not None:
+                loss = loss + self.ewc_coef * ewc
+                ewc_val = float(ewc.item())
+
             self.enc_optim.zero_grad()
             loss.backward()
             grad_norm = float(nn.utils.clip_grad_norm_(self.encoder.parameters(), clip))
             self.enc_optim.step()
             dyn_val, kl_val = float(dyn.item()), float(kl.item())
 
-        return {"dyn_loss": dyn_val, "encoder_kl": kl_val, "enc_grad_norm": grad_norm}
+        return {"dyn_loss": dyn_val, "encoder_kl": kl_val, "enc_grad_norm": grad_norm,
+                "ewc_loss": ewc_val, "anchor_loss": anc_val}
+
+    def _encoder_anchor_loss(self, feats: torch.Tensor, ctx: torch.Tensor,
+                             seg_len: int) -> Optional[torch.Tensor]:
+        """Hold each INACTIVE context's replayed segments at its stored centre.
+
+        ``(zbar_L - m_c)^2`` over replayed segments whose context is known, has a
+        confident centre snapshot, and is not the context currently being learned.
+
+        The asymmetry it targets: encoder updates are GLOBAL -- one step moves the code
+        of every task, including tasks not currently running -- while COIN updates only
+        the context it holds responsible. Every idle context's centre is therefore
+        stale, and nothing corrects it until that task recurs.
+
+        Restricted to inactive contexts on purpose. Anchoring the ACTIVE segment closes
+        a loop with COIN's own belief whose fixed point is any current agreement,
+        including a wrong one: a task misassigned to an established context would be
+        pulled onto that context's centre, cementing the capture. Returns ``None`` when
+        no segment in the batch qualifies.
+        """
+        rows, centres = [], []
+        for j, c in enumerate(ctx.tolist()):
+            if c < 0 or c == self._active_ctx or c not in self.ctx_centre:
+                continue
+            rows.append(j)
+            centres.append(self.ctx_centre[c])
+        if not rows:
+            return None
+        mean, _ = self.encoder.prefix_posterior(feats, seg_len)
+        z_final = mean[rows, -1]
+        target = torch.as_tensor(centres, dtype=z_final.dtype, device=z_final.device)
+        return (z_final - target).pow(2).mean()
+
+    def _note_context(self, coin, rho_vec, k: int) -> int:
+        """Record which context owned this segment and, while it owned it CONFIDENTLY,
+        snapshot its z-centre for the anchor. Returns the context id (-1 if none)."""
+        known = np.nan_to_num(np.asarray(rho_vec[:k], dtype=float), nan=0.0)
+        if k <= 0 or not known.size or known.max() <= 0.0:
+            self._active_ctx = -1
+            return -1
+        dom = int(np.argmax(known))
+        if known[dom] >= self.anchor_rho_min:
+            proto = coin.context_alignment()["global_contexts"]
+            mu_c = (np.asarray(proto["state_mean"][dom], dtype=float).reshape(-1)
+                    + np.asarray(proto["bias_mean"][dom], dtype=float).reshape(-1))
+            self.ctx_centre[dom] = float(mu_c[0])          # the z dimension
+        self._active_ctx = dom
+        return dom
+
+    # ------------------------------------------------------------------
+    # Elastic weight consolidation (alternative to the replay pool)
+    # ------------------------------------------------------------------
+    def _head_params(self) -> Dict[str, torch.nn.Parameter]:
+        """Instantiated context heads' policy and value parameters, keyed by context."""
+        out = {}
+        for cid in self.context_keys:
+            if self.context_init.get(cid, 0) == 0:
+                continue
+            _, policy, value_net, _ = self.nets[cid]
+            for tag, net in (("pol", policy), ("val", value_net)):
+                for n, p in net.named_parameters():
+                    out[f"head.{cid}.{tag}.{n}"] = p
+        return out
+
+    def _ewc_head_penalty(self) -> Optional[torch.Tensor]:
+        """``sum_i F_i (theta_i - theta*_i)^2 / 2`` over the context HEADS.
+
+        Kirkpatrick's penalty applied where the Figure-3 EWC baseline applies it -- the
+        policy -- rather than to the encoder. The failure it targets is the DETECTION
+        LAG: COIN does eventually birth a context for an arriving task, but during the
+        rollouts before that birth the new task runs on the established task's head and
+        overwrites it (measured: a head scoring 200 at the end of its own block ends at
+        9, while the arriving task reaches 100-200 on every head).
+
+        Applied in the PPO update, where the heads are optimised -- the encoder penalty
+        lives in :meth:`_update_encoder` instead, since the two sets of parameters have
+        separate optimisers.
+        """
+        if self.ewc_head_coef <= 0.0 or not self.ewc_head_tasks:
+            return None
+        params = self._head_params()
+        total = None
+        for star, fisher in self.ewc_head_tasks:
+            for name, p in params.items():
+                if name not in fisher:          # head born after this consolidation
+                    continue
+                term = (fisher[name] * (p - star[name]).pow(2)).sum()
+                total = term if total is None else total + term
+        return None if total is None else 0.5 * total
+
+    def consolidate_heads(self, seg_len: int, n_batches: int = 16,
+                          mb_segments: int = 4) -> Dict[str, float]:
+        """Snapshot the context heads and estimate their diagonal Fisher.
+
+        The Fisher is Kirkpatrick's: the mean squared gradient of ``log pi(a | s)``
+        under each head, evaluated on replayed states and actions. Both are recoverable
+        from the stored encoder features -- ``s`` is the leading ``obs_dim`` columns and
+        the action one-hot follows it -- so this needs no extra storage.
+        """
+        params = self._head_params()
+        fisher = {n: torch.zeros_like(p) for n, p in params.items()}
+        od, ad = self.obs_dim, self.act_dim
+        n_done = 0
+        for _ in range(int(n_batches)):
+            feats = self.replay.sample(mb_segments).to(self.device)
+            obs = feats[:, :od]
+            if self.action_continuous:
+                break                       # log-prob Fisher below assumes discrete
+            act = feats[:, od:od + ad].argmax(dim=-1)
+            for cid in self.context_keys:
+                if self.context_init.get(cid, 0) == 0:
+                    continue
+                _, policy, _, _ = self.nets[cid]
+                logp = torch.distributions.Categorical(
+                    logits=policy(obs)).log_prob(act).mean()
+                grads = torch.autograd.grad(logp, list(policy.parameters()),
+                                            retain_graph=False, allow_unused=True)
+                for (n, _p), g in zip(policy.named_parameters(), grads):
+                    if g is not None:
+                        fisher[f"head.{cid}.pol.{n}"] += g.detach().pow(2)
+            n_done += 1
+        for name in fisher:
+            fisher[name] /= float(max(n_done, 1))
+        star = {n: p.detach().clone() for n, p in params.items()}
+        self.ewc_head_tasks.append((star, fisher))
+        return {"n_head_tasks": float(len(self.ewc_head_tasks)),
+                "head_fisher_trace": float(sum(f.sum() for f in fisher.values()))}
+
+    def _ewc_params(self) -> Dict[str, torch.nn.Parameter]:
+        """Parameters EWC protects. The decoder is included by default: it carries the
+        task-specific part of the dynamics model, so protecting the encoder alone
+        leaves it free to re-fit to the new task and the old task is forgotten anyway
+        (measured: encoder-only EWC is indistinguishable from no protection at every
+        coefficient up to 1e6)."""
+        out = {f"enc.{n}": p for n, p in self.encoder.named_parameters()}
+        if self.ewc_protect_decoder:
+            out.update({f"dec.{n}": p for n, p in self.decoder.named_parameters()})
+        return out
+
+    def _ewc_penalty(self) -> Optional[torch.Tensor]:
+        """``sum_tasks sum_i F_i (theta_i - theta*_i)^2 / 2`` over the ENCODER.
+
+        The replay pool keeps old tasks trainable by keeping their DATA; this keeps
+        them by keeping the parameters that explained them, weighted by how much each
+        parameter mattered (the diagonal Fisher). Returns ``None`` when nothing has
+        been consolidated yet, so an un-consolidated agent is bit-identical to the
+        replay-only baseline.
+        """
+        if self.ewc_coef <= 0.0 or not self.ewc_tasks:
+            return None
+        total = None
+        params = self._ewc_params()
+        for star, fisher in self.ewc_tasks:
+            for name, p in params.items():
+                term = (fisher[name] * (p - star[name]).pow(2)).sum()
+                total = term if total is None else total + term
+        return None if total is None else 0.5 * total
+
+    def consolidate_encoder(self, seg_len: int, n_batches: int = 32,
+                            mb_segments: int = 4) -> Dict[str, float]:
+        """Snapshot the encoder and estimate its diagonal Fisher on the CURRENT pool.
+
+        Call at a task boundary, before the pool turns over to the next task. The
+        Fisher is the empirical one -- the mean squared gradient of the same objective
+        the encoder is trained on -- which is the standard EWC estimate and needs no
+        extra machinery. Snapshots accumulate, so consolidating after each task adds a
+        term rather than replacing the previous one.
+        """
+        params = self._ewc_params()
+        fisher = {n: torch.zeros_like(p) for n, p in params.items()}
+        for _ in range(int(n_batches)):
+            feats = self.replay.sample(mb_segments).to(self.device)
+            mean, sd = self.encoder.prefix_posterior(feats, seg_len)
+            z = (mean[:, :-1] + torch.randn_like(sd[:, :-1]) * sd[:, :-1]).reshape(-1)
+            loss = (self._dyn_loss(feats, z, seg_len)
+                    + self.kl_coef * self._kl_to_prior(mean, sd).mean())
+            self.enc_optim.zero_grad()
+            loss.backward()
+            for name, p in params.items():
+                if p.grad is not None:
+                    fisher[name] += p.grad.detach().pow(2)
+        self.enc_optim.zero_grad()
+        for name in fisher:
+            fisher[name] /= float(max(int(n_batches), 1))
+        star = {n: p.detach().clone() for n, p in params.items()}
+        self.ewc_tasks.append((star, fisher))
+        total = float(sum(f.sum() for f in fisher.values()))
+        return {"n_tasks": float(len(self.ewc_tasks)), "fisher_trace": total}
 
     def pretrain_encoder(self, envs, seg_steps: int = 512, n_iters: int = 50,
                          enc_steps: int = 32, mb_segments: int = 4) -> Dict[str, np.ndarray]:
@@ -3400,7 +3699,6 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
 
             with torch.no_grad():
                 mean_s, sd_s = enc.prefix_posterior(feats_s, L)
-            self.replay.push(feats_s, group=group)
             seg_z.append(float(mean_s[0, -1]))
             seg_z_sd.append(float(sd_s[0, -1]))
             # COIN's sensory noise for this trial IS the encoder's uncertainty; the pipeline
@@ -3430,9 +3728,14 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
 
             # Post-observation diagnostics; K may have grown, so re-query the alignment.
             K_post = int(coin.context_alignment()["K"])
-            seg_rho.append(coin_context_vector(coin.responsibilities_vector(),
-                                               min(K_post, W - 1), width=W,
-                                               renormalise_novel=False))
+            rho_vec = coin_context_vector(coin.responsibilities_vector(),
+                                          min(K_post, W - 1), width=W,
+                                          renormalise_novel=False)
+            seg_rho.append(rho_vec)
+            # The segment is pushed AFTER observe_y so its label is COIN's verdict on
+            # this segment, not the belief it carried in.
+            seg_ctx_id = self._note_context(coin, rho_vec, min(K_post, W - 1))
+            self.replay.push(feats_s, group=group, ctx=seg_ctx_id)
 
         # ---------- 2. tensors and advantages ----------
         obs_tensor = torch.stack(store["obs"]).to(self.device)
@@ -3473,6 +3776,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
         # ---------- 3. PPO update (context heads only) ----------
         n = S * L
         actor_loss = critic_loss = None
+        ewc_head_val = float("nan")
         for _ in range(mini_epochs):
             idxs = torch.randperm(n)
             for start in range(0, n, mb_size):
@@ -3487,6 +3791,15 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
                 actor_loss = -surr.mean()
                 critic_loss = (ret_tensor[mb] - self._mixed_value(b_obs, b_w)).pow(2).mean()
                 loss = actor_loss + self.vf_coef * critic_loss - self.ent_coef * entropy
+
+                # Kirkpatrick's penalty on the HEADS, applied where they are
+                # optimised. Protects an established head through COIN's detection
+                # lag -- the rollouts between a task switch and the birth of a
+                # context for it, during which the new task trains the old head.
+                head_ewc = self._ewc_head_penalty()
+                if head_ewc is not None:
+                    loss = loss + self.ewc_head_coef * head_ewc
+                    ewc_head_val = float(head_ewc.item())
 
                 for opt in self._all_optimizers():
                     opt.zero_grad()
@@ -3533,6 +3846,7 @@ class AmortisedCOINPPOAgent(COINPPOAgent):
             "mean_episode_return": np.asarray(seg_returns, dtype=float),
             "mean_reward_per_step": float(np.mean(store["rew"])),
             "value_loss": float(critic_loss.item()), "policy_loss": float(actor_loss.item()),
+            "ewc_head_loss": ewc_head_val,
             **enc_stats,
         }
 

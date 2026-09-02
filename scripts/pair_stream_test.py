@@ -1,4 +1,4 @@
-﻿"""Parametrised miniature pair-stream test: task A block then task B block on the
+"""Parametrised miniature pair-stream test: task A block then task B block on the
 minimal stack (2-D COIN observation + value term + reward features),
 expert-bootstrapped heads, per-rollout probe-code traces, and a post-stream
 evaluate_identifying (the real z-marginal eval) on both tasks. NOT a pilot -- a
@@ -81,6 +81,35 @@ def collect_probe(agent_amort, expert, task):
     return torch.cat(feats)
 
 
+def eval_fixed_head(agent, env, head_index, n_episodes=10, max_steps=200):
+    """Mean return with the acting weights PINNED to one head (oracle routing).
+
+    Separates the two failures the gates cannot distinguish: if some head still scores
+    on task A, the knowledge survived and only the ROUTING lost it; if no head scores,
+    the head itself was overwritten.
+    """
+    import torch
+
+    w = torch.zeros(agent.num_contexts, dtype=torch.float32, device=agent.device)
+    w[head_index] = 1.0
+    rets = []
+    with torch.no_grad():
+        for ep in range(n_episodes):
+            obs, _ = env.reset(seed=12345 + ep)
+            obs_t = agent._flatten_obs(obs)
+            total = 0.0
+            for _ in range(max_steps):
+                a = agent._deterministic_action(obs_t, w)
+                obs, r, done, trunc, info = env.step(a)
+                total += (float(info.get("raw_reward", r))
+                          if isinstance(info, dict) else float(r))
+                if done or trunc:
+                    break
+                obs_t = agent._flatten_obs(obs)
+            rets.append(total)
+    return float(np.mean(rets))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -89,6 +118,53 @@ def main():
     ap.add_argument("--seed", type=int, default=0,
                     help="stream seed: seed_everything, COIN rng, rollout env seeds"
                          " (experts and probe/eval seeds stay fixed across arms)")
+    ap.add_argument("--ewc-coef", type=float, default=0.0,
+                    help="EWC on encoder AND decoder, consolidated whenever COIN"
+                         " births a context; 0 = the committed replay-only baseline."
+                         " Needs ~1e8: this objective's Fisher is ~1e-10")
+    ap.add_argument("--learn-gate", choices=("off", "thresh", "argmax"), default="off",
+                    help="OWL-style credit-assignment gate: which heads may receive"
+                         " gradient. Behaviour (the acting mixture) is unchanged")
+    ap.add_argument("--learn-gate-thresh", type=float, default=0.1)
+    ap.add_argument("--probe-switch", action="store_true",
+                    help="probe every head on task A at the end of block A, before"
+                         " task B arrives")
+    ap.add_argument("--no-inject", action="store_true",
+                    help="skip the expert-injection bootstrap of newly born heads."
+                         " Injection is a diagnostic crutch: its one-rollout return"
+                         " jump is itself a large surprise on COIN's value dimension"
+                         " and has been measured to cause spurious births")
+    ap.add_argument("--anchor-coef", type=float, default=0.0,
+                    help="COIN-centre anchor: hold inactive contexts' replayed"
+                         " segments at the centre COIN stored for them. Its gradient"
+                         " must sit BELOW the dynamics gradient (~0.03 works; 0.3"
+                         " collapses the codes below COIN's observation noise)")
+    ap.add_argument("--stationary-sd", type=float, default=None,
+                    help="loosen COIN's drift prior so each context LEARNS a drift"
+                         " parking its stationary value d/(1-a) at its own coordinate:"
+                         " prior_precision_drift = 1/((1-a)^2 sd^2). None keeps the"
+                         " published prior, under which an idle context reverts to"
+                         " ~0 in ~12 trials and becomes the decoy an arriving task"
+                         " captures instead of triggering a birth")
+    ap.add_argument("--act-gate", choices=("off", "argmax"), default="off",
+                    help="OWL-style hard acting routing: one head acts alone, so each"
+                         " head must be individually competent")
+    ap.add_argument("--ewc-heads-coef", type=float, default=0.0,
+                    help="Kirkpatrick's penalty on the context HEADS -- the Figure-3"
+                         " EWC baseline's own target -- consolidated whenever COIN"
+                         " births a context, to protect an established head through"
+                         " the detection lag. Independent of --ewc-coef, because"
+                         " encoder EWC was measured to hurt on a live stream")
+    # Ablation switches for the components the committed agent turns on by default.
+    ap.add_argument("--value-coef", type=float, default=1e-3,
+                    help="responsibility-path value term; 0 removes it")
+    ap.add_argument("--no-encoder-reward", action="store_true",
+                    help="drop the reward from the encoder features and the decoder's"
+                         " reward head")
+    ap.add_argument("--no-observe-value", action="store_true",
+                    help="COIN observes z alone (1-D) instead of (z, episodic return)")
+    ap.add_argument("--ewc-max-tasks", type=int, default=8,
+                    help="cap on accumulated EWC snapshots (cost grows linearly)")
     args = ap.parse_args()
 
     import torch
@@ -114,14 +190,28 @@ def main():
     agent = AmortisedCOINPPOAgent(
         proto, CTX_IDS, prior_sd=0.5, kl_coef=KL_BETA,
         encoder_lr=3e-4, replay_capacity=512,
-        value_coef=1e-3, encoder_reward=True, observe_value=True,
+        value_coef=args.value_coef,
+        encoder_reward=not args.no_encoder_reward,
+        observe_value=not args.no_observe_value,
+        ewc_coef=args.ewc_coef, ewc_head_coef=args.ewc_heads_coef,
+        learn_gate=args.learn_gate,
+        learn_gate_thresh=args.learn_gate_thresh, act_gate=args.act_gate,
+        anchor_coef=args.anchor_coef,
         same_task_rollout=True, **f3.PPO_KWARGS)
     proto.close()
     # COIN at its published priors: the PEARL bottleneck holds z in the model's
     # native envelope (prior_sd 0.5 -> codes ~ +-1 at 2 sigma), so no retention or
     # process-noise surgery is needed; motor noise is the sensorimotor default pair.
+    coin_kw = {}
+    if args.stationary_sd is not None:
+        a0 = 0.9425                       # prior_mean_retention (package default)
+        coin_kw["prior_precision_drift"] = 1.0 / ((1.0 - a0) ** 2
+                                                  * args.stationary_sd ** 2)
+    # The COIN model must match what the agent will hand it: 2-D (z, return) unless
+    # the value observation is ablated away, in which case it observes z alone.
     coin = RealTimeCOIN(rng=args.seed, sigma_motor_noise=0.0182,
-                        state_dim=2, max_contexts=10)
+                        state_dim=1 if args.no_observe_value else 2,
+                        max_contexts=10, **coin_kw)
 
     probes = {t: collect_probe(agent, experts[t][2], t) for t in (MC, FLAT)}
 
@@ -141,6 +231,7 @@ def main():
     rho_hist = np.full((n_total, W), np.nan)    # post-observation responsibilities
     wact_hist = np.full((n_total, W), np.nan)   # mean ACTING weights
     injected = set()
+    head_ret_mid = np.full(agent.num_contexts, np.nan)
     code[0, 0], spread[0, 0] = encode(MC)
     code[0, 1], spread[0, 1] = encode(FLAT)
 
@@ -155,7 +246,7 @@ def main():
             f3.close_envs(envs)
             # Diagnostic bootstrap: a newly instantiated head gets this block's
             # expert weights (in-place, so the head optimiser stays valid).
-            for cid in agent.context_keys[:-1]:
+            for cid in (agent.context_keys[:-1] if not args.no_inject else []):
                 if agent.context_init.get(cid, 0) == 1 and cid not in injected:
                     p_sd, v_sd, _ = experts[task]
                     agent.nets[cid][1].load_state_dict(p_sd)
@@ -171,7 +262,45 @@ def main():
                 print(f"[NAN] first at rollout {i}: params {bad[:4]}; "
                       f"dyn={r['dyn_loss']:.5f} vloss={r['enc_value_loss']}",
                       flush=True)
+            # End of block A: probe every head on task A BEFORE task B arrives. This
+            # is what separates "block B destroyed the head" from "block A never
+            # produced an individually competent head in the first place" -- the
+            # end-of-run oracle probe cannot tell those apart.
+            if args.probe_switch and i == BLOCKS[0][1] - 1:
+                env_a = f3.make_task_env(MC, None, 200, train=False)
+                mid = {j: eval_fixed_head(agent, env_a, j)
+                       for j, cid in enumerate(agent.context_keys[:-1])
+                       if agent.context_init.get(cid, 0) == 1}
+                env_a.close()
+                for j, v in mid.items():
+                    head_ret_mid[j] = v
+                print(f"[mid] end of block A, task A per head: "
+                      f"{ {k: round(v) for k, v in mid.items()} }", flush=True)
+
             kpost[i] = int(coin.context_alignment()["K"])
+            # Consolidate on a BIRTH: COIN announcing a new context is the model's own
+            # statement that the task changed, so it is the boundary EWC needs without
+            # the agent being told the schedule. The pool is a reservoir over the whole
+            # stream, so the Fisher here covers everything seen so far.
+            # Consolidate the HEADS on a birth too: at that moment the previous
+            # context's head is the best it will ever be, and the arriving task is
+            # about to compete for it.
+            if (args.ewc_heads_coef > 0.0 and i > 0 and kpost[i] > kpost[i - 1]
+                    and len(agent.ewc_head_tasks) < args.ewc_max_tasks
+                    and len(agent.replay) > 0):
+                hi = agent.consolidate_heads(SEG_STEPS, n_batches=16, mb_segments=4)
+                print(f"[ewc-heads] rollout {i}: K {kpost[i-1]}->{kpost[i]}, "
+                      f"consolidated (task {int(hi['n_head_tasks'])}, "
+                      f"fisher trace {hi['head_fisher_trace']:.3e})", flush=True)
+
+            if (args.ewc_coef > 0.0 and i > 0 and kpost[i] > kpost[i - 1]
+                    and len(agent.ewc_tasks) < args.ewc_max_tasks
+                    and len(agent.replay) > 0):
+                info = agent.consolidate_encoder(SEG_STEPS, n_batches=32,
+                                                 mb_segments=4)
+                print(f"[ewc] rollout {i}: K {kpost[i-1]}->{kpost[i]}, "
+                      f"consolidated (task {int(info['n_tasks'])}, "
+                      f"fisher trace {info['fisher_trace']:.3e})", flush=True)
             vsteps[i] = r.get("ep_value_steps", np.nan)
             pi_hist[i] = np.nanmean(r["pi"], axis=0)
             rho_hist[i] = np.nanmean(np.asarray(r["rho"], dtype=float), axis=0)
@@ -183,6 +312,7 @@ def main():
                       f"z_mc={code[i + 1, 0]:+.3f} z_flat={code[i + 1, 1]:+.3f} "
                       f"gap={gap:.3f} K={kpost[i]} vsteps={vsteps[i]:.0f} "
                       f"ret={np.nanmean(r['mean_episode_return']):.1f} "
+                      f"anc={r.get('anchor_loss', float('nan')):.3f} "
                       f"act={dom}:{np.nanmax(wact_hist[i]):.2f} "
                       f"pi={np.round(np.nan_to_num(pi_hist[i][:6]), 2)} "
                       f"rho={np.round(np.nan_to_num(rho_hist[i][:6]), 2)}",
@@ -203,9 +333,25 @@ def main():
         print(f"[eval] {f3.TASK_NAMES[t]:<16}: return {eval_ret[t]:7.1f}  "
               f"head {eval_head[t]} (w={eval_w[t]:.2f})", flush=True)
 
+    # ---- oracle routing: does ANY head still know each task? ----
+    head_ret = np.full((2, agent.num_contexts), np.nan)
+    for r, t in enumerate((MC, FLAT)):
+        env = f3.make_task_env(t, None, 200, train=False)
+        per = {}
+        for j, cid in enumerate(agent.context_keys[:-1]):
+            if agent.context_init.get(cid, 0) == 1:
+                per[j] = eval_fixed_head(agent, env, j)
+                head_ret[r, j] = per[j]
+        env.close()
+        top = max(per, key=per.get) if per else -1
+        print(f"[oracle] {f3.TASK_NAMES[t]:<16}: best head {top} -> "
+              f"{per.get(top, float('nan')):7.1f}   all: "
+              f"{ {k: round(v) for k, v in per.items()} }", flush=True)
+
     np.savez(args.out, code=code, spread=spread, kpost=kpost, vsteps=vsteps,
              pi_hist=pi_hist, rho_hist=rho_hist, wact_hist=wact_hist,
-             blocks=np.array(BLOCKS),
+             blocks=np.array(BLOCKS), head_ret=head_ret,
+             head_ret_mid=head_ret_mid,
              eval_returns=np.array([eval_ret[MC], eval_ret[FLAT]]),
              eval_heads=np.array([eval_head[MC], eval_head[FLAT]]),
              eval_wmax=np.array([eval_w[MC], eval_w[FLAT]]),
@@ -222,6 +368,14 @@ def main():
           "- divergence gate: gap_end > max(3*pooled_sd, gap_start+0.2)")
     print("PASS" if eval_head[MC] != eval_head[FLAT] else "FAIL",
           "- eval-separation gate: distinct dominant heads under z-marginal eval")
+    # The gate the other two miss: separation and birth can both look healthy while
+    # task A's head is quietly destroyed by the block-B stream.
+    oracle_a = float(np.nanmax(head_ret[0]))
+    print("PASS" if oracle_a > 140.0 else "FAIL",
+          f"- retention gate: best head on task A = {oracle_a:.1f}"
+          f" (self-identified {eval_ret[MC]:.1f}) -> "
+          + ("ROUTING lost it (the head survives)" if oracle_a > 140.0
+             else "the HEAD was overwritten"))
 
 
 if __name__ == "__main__":
