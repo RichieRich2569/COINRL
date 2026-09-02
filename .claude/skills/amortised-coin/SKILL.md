@@ -12,8 +12,9 @@ where a number is unverified or superseded it says so.
 
 **Last updated 2026-09-02.** 54 tests.
 
-**Where this work lives.** Branch `amortised-coin-protection` on `origin`, forked from
-`realtime-coinrl` at `99b1d73`. Developed in worktree `.claude/worktrees/ewc-encoder`.
+**Where this work lives.** Merged into `realtime-coinrl` on `origin`; the feature branch
+`amortised-coin-protection` is kept as the review point. Developed in worktree
+`.claude/worktrees/ewc-encoder`.
 The off-policy `V_z` line (`V_ξ(s,z)` replacing the PPO critic, plus `zvalue_probe.py`,
 `plot_pair_run.py`, `coin_synth_test.py`, `model_equations.md`) lives **only** in the
 working tree of `.claude/worktrees/offpolicy-zvalue` — uncommitted as of this writing.
@@ -318,7 +319,17 @@ eval-time routing.
 4. The COIN column of this probe is **uninformative** (K=1 everywhere): random actions
    + 400 encoder steps do not build codes COIN can split.
 
-### 6.6 Older arm table (mirror pair, seed 1, oracle probe)
+### 6.6 The "first double-pass" run, and why it is not a success
+
+`logs/pairstream_e2min_mirror_t34_s2.log` (`7f623b8`, minimal stack, seed 2, injection
+ON, run on the second machine) is committed as "PASSES both gates — first double-pass,
+z gap 1.98". Read the rest of the log before citing it: **K final 10** and **CartPole
+eval 9.5**. The two original gates measure separation, not competence, so they pass
+while task A is destroyed and COIN has proliferated ten contexts. This run is the
+reason the third gate (retention, under *oracle* routing) exists. Treat it as evidence
+about separation only.
+
+### 6.7 Older arm table (mirror pair, seed 1, oracle probe)
 
 | arm | div | sep | K | CartPole oracle | Mirror oracle |
 |---|---|---|---|---|---|
