@@ -15,10 +15,9 @@ where a number is unverified or superseded it says so.
 **Where this work lives.** Merged into `realtime-coinrl` on `origin`; the feature branch
 `amortised-coin-protection` is kept as the review point. Developed in worktree
 `.claude/worktrees/ewc-encoder`.
-The off-policy `V_z` line (`V_ξ(s,z)` replacing the PPO critic, plus `zvalue_probe.py`,
-`plot_pair_run.py`, `coin_synth_test.py`, `model_equations.md`) lives **only** in the
-working tree of `.claude/worktrees/offpolicy-zvalue` — uncommitted as of this writing.
-Commit it before removing that worktree or it is gone.
+The off-policy `V_z` line is described in §5.2; as of this writing it is **uncommitted**
+in the working tree of `.claude/worktrees/offpolicy-zvalue`. Commit it to a branch
+before removing that worktree or it is gone.
 
 **Keeping this file current.** It is the working log, so it is part of the deliverable,
 not a byproduct: any commit that adds, removes or measures a mechanism updates the
@@ -199,7 +198,9 @@ Two of these keep resurfacing in new clothes:
 
 ---
 
-## 5. Experimental additions (uncommitted, worktree `ewc-encoder`)
+## 5. Experimental additions
+
+### 5.1 On `amortised-coin-protection` (merged into `realtime-coinrl`)
 
 - **`ewc_coef` / `ewc_protect_decoder`** — diagonal empirical Fisher of the same
   `L_dyn + β·KL` objective, snapshots accumulate; `consolidate_encoder()`.
@@ -216,9 +217,44 @@ Two of these keep resurfacing in new clothes:
   deliberately not the active context: anchoring the active segment closes a loop with
   COIN whose fixed point is *any* current agreement, including a wrong one.
 
-Separate worktree `offpolicy-zvalue` (not merged): off-policy TD(0) grounding
-`L = E_D[(V_ξ(s,z) − y)²]`, `y = r/κ + γ(1−d)V_ξ̄(s', sg[z])`, Polyak target, κ=200,
-with `V_ξ` **replacing** the PPO critic.
+### 5.2 The off-policy `V_z` line — branch `offpolicy-zvalue`
+
+A separate stack, **never merged and not validated**. Worktree
+`.claude/worktrees/offpolicy-zvalue`; intended branch name `offpolicy-zvalue`.
+
+*The idea.* PEARL states that dynamics prediction is not needed, and `L_dyn` was
+observed to train `z` for **competence** rather than task identity. So ground `z`
+off-policy instead, with a TD(0) residual, and let COIN handle the on-policy part:
+
+```
+L_zval = E_D[ (V_xi(s_t, z_t) − y_t)^2 ],
+y_t    = r_t/kappa + gamma (1 − d_t) V_xibar(s_{t+1}, sg[z_t]),   kappa = 200
+```
+
+Polyak-averaged target `V_xibar`. In the last configuration tried, `V_xi` **replaced**
+the PPO critic (`ppo_value_from_z`: `_ppo_value` returns
+`zvalue_net(cat([obs, z])) · value_obs_scale`, PPO's own critic term zeroed) while COIN
+continued to observe the episodic return as its second dimension.
+
+*What it contains beyond the merged branch:* the `V_xi` critic and its target network,
+the COIN-centre anchor in its original form, `scripts/zvalue_probe.py`,
+`scripts/plot_pair_run.py`, `scripts/coin_synth_test.py`, `model_equations.md`. 58 tests.
+
+*What it measured.*
+- The **only** configuration in ~15 arms across both worktrees where an anchor
+  preserved task A: COIN-centre anchor at coef 0.03, CartPole eval 122 / oracle 135
+  (`models/wt_anchor_003.npz`). Clean A/B within that stack (9.3 without). It does
+  **not** transfer to the merged stack (§6.7).
+- Retention is unsolved there too: K = 10 contexts instantiated, which is its own
+  failure.
+- Lesson worth keeping: zero-initialising the bootstrapped head made the TD term
+  **inert** (loss 1.9e-5 → 2.4e-7, `|V_ξ|` stuck at 0.009). Use the default init.
+  Caught only because `zvalue_probe.py` reports per-term gradient norms.
+
+*Status.* Superseded as the retention story by head EWC + hard routing, but it holds
+the one positive anchor result and the only off-policy grounding implementation. Keep
+the branch; do not merge it into `main` or `realtime-coinrl` — it replaces the PPO
+critic, which is a training-path change that has never passed the gates.
 
 ---
 
